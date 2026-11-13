@@ -1,0 +1,338 @@
+import re
+from functools import lru_cache
+from html import escape
+from pathlib import Path
+
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen, QPixmap, QTextLayout
+from PySide6.QtGui import QTextOption
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout
+
+from qfluentwidgets import (
+    BodyLabel, CaptionLabel, CardWidget, FluentIcon, StrongBodyLabel,
+    TransparentToolButton, ToolTipFilter, isDarkTheme,
+)
+
+from app.config import MEDIA_LABELS, ROOT
+from app.media_meta import book_stats_text, movie_stats_text
+
+
+def _two_line_text(text: str, font, width: int) -> str:
+    text = re.sub(r'\s+', ' ', text or '').strip()
+    if not text:
+        return ''
+    metrics = QFontMetrics(font)
+    if metrics.horizontalAdvance(text) <= width:
+        return text
+    layout = QTextLayout(text, font)
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+    layout.setTextOption(option)
+    layout.beginLayout()
+    first = layout.createLine()
+    if not first.isValid():
+        return text
+    first.setLineWidth(width)
+    second = layout.createLine()
+    if not second.isValid():
+        return text
+    second.setLineWidth(width)
+    layout.endLayout()
+    first_text = text[first.textStart():first.textStart() + first.textLength()].rstrip()
+    rest = text[second.textStart():]
+    second_text = metrics.elidedText(rest, Qt.ElideRight, width)
+    return first_text + '\n' + second_text
+
+
+def _elided_lines(text: str, font, width: int, max_lines: int) -> str:
+    text = re.sub(r'\s+', ' ', text or '').strip()
+    if not text:
+        return ''
+    metrics = QFontMetrics(font)
+    layout = QTextLayout(text, font)
+    option = QTextOption()
+    option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+    layout.setTextOption(option)
+    layout.beginLayout()
+    ranges = []
+    for _ in range(max_lines):
+        line = layout.createLine()
+        if not line.isValid():
+            break
+        line.setLineWidth(width)
+        ranges.append((line.textStart(), line.textLength()))
+    layout.endLayout()
+    if not ranges:
+        return text
+    lines = [text[start:start + length].rstrip() for start, length in ranges]
+    last_start, last_length = ranges[-1]
+    if last_start + last_length < len(text):
+        lines[-1] = metrics.elidedText(text[last_start:], Qt.ElideRight, width)
+    return '\n'.join(lines)
+
+
+def _highlight_html(text: str, keyword: str) -> str:
+    if not keyword:
+        return escape(text).replace('\n', '<br>')
+    parts = []
+    last = 0
+    for match in re.finditer(re.escape(keyword), text, re.IGNORECASE):
+        parts.append(escape(text[last:match.start()]))
+        parts.append(
+            '<span style="background-color:#e5b45f;color:#171a20;border-radius:2px;">'
+            + escape(match.group(0)) + '</span>'
+        )
+        last = match.end()
+    parts.append(escape(text[last:]))
+    return ''.join(parts).replace('\n', '<br>')
+
+
+def _cover_pixmap(path: str, width: int, height: int, fill: bool = False) -> QPixmap:
+    if not path:
+        return _empty_pixmap(width, height)
+    full = Path(path)
+    if not full.is_absolute():
+        full = ROOT / full
+    if not full.exists():
+        return _empty_pixmap(width, height)
+    try:
+        stamp = full.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    return _scaled_cover(str(full), width, height, fill, stamp)
+
+
+def _empty_pixmap(width: int, height: int) -> QPixmap:
+    canvas = QPixmap(width, height)
+    canvas.fill(QColor('#0f131b'))
+    return canvas
+
+
+@lru_cache(maxsize=600)
+def _scaled_cover(full_path: str, width: int, height: int, fill: bool,
+                  mtime_ns: int) -> QPixmap:
+    canvas = _empty_pixmap(width, height)
+    pixmap = QPixmap(full_path)
+    if pixmap.isNull():
+        return canvas
+    if fill:
+        scaled = pixmap.scaled(width, height, Qt.KeepAspectRatioByExpanding,
+                               Qt.SmoothTransformation)
+        painter = QPainter(canvas)
+        painter.drawPixmap((width - scaled.width()) // 2,
+                           (height - scaled.height()) // 2, scaled)
+        painter.end()
+        return canvas
+    scaled = pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+    painter = QPainter(canvas)
+    painter.drawPixmap((width - scaled.width()) // 2, (height - scaled.height()) // 2, scaled)
+    painter.end()
+    return canvas
+
+
+class RecordCard(CardWidget):
+    edit_requested = Signal(int)
+    detail_requested = Signal(int)
+    link_requested = Signal(str)
+    delete_requested = Signal(int)
+    cover_requested = Signal(int)
+
+    def __init__(self, record, parent=None, highlight: str = ''):
+        super().__init__(parent)
+        self.record = record
+        self.highlight = (highlight or '').strip()
+        self.setObjectName('recordCard')
+        self.comment = record['comment'] or ''
+        self.setFixedWidth(214)
+        self.setBorderRadius(12)
+        self.setClickEnabled(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.clicked.connect(lambda: self.detail_requested.emit(int(self.record['id'])))
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(7 if self.comment else 5)
+
+        cover = QLabel(self)
+        cover.setFixedSize(194, 272)
+        cover.setAlignment(Qt.AlignCenter)
+        cover.setPixmap(_cover_pixmap(record['cover_path'] or '', 194, 272))
+        cover.setStyleSheet('background:#0f131b; border-radius:7px;')
+        self.cover_label = cover
+        layout.addWidget(cover)
+
+        title = StrongBodyLabel('', self)
+        title.setWordWrap(True)
+        metrics = QFontMetrics(title.font())
+        title.setFixedHeight(metrics.lineSpacing() * 2 + 2)
+        self.title_label = title
+        self.title_text = _elided_lines(record['title'] or '', title.font(), 194, 2)
+        title.setToolTip(record['title'] or '')
+        layout.addWidget(title)
+
+        if record['media_type'] == 'book':
+            stats = book_stats_text(record['subject_id'], int(record['word_count'] or 0))
+        else:
+            stats = movie_stats_text(record['intro'] or '', record['subject_id'])
+        stats_label = CaptionLabel(stats, self)
+        stats_label.setTextColor('#5f6b7a', '#8d95a5')
+        if record['book_file']:
+            stats_label.setToolTip(record['book_file'])
+        self.stats_label = stats_label
+        layout.addWidget(stats_label)
+
+        meta = QHBoxLayout()
+        meta.setSpacing(5)
+        stars = int(record['rating'] or 0)
+        star_label = BodyLabel('★' * stars + '☆' * (5 - stars) if stars else '未评分', self)
+        star_label.setStyleSheet('color:#e5b45f; font-size:12px;')
+        self.star_label = star_label
+        meta.addWidget(star_label)
+        meta.addStretch(1)
+        date_text = record['effective_date'] or record['marked_date'] or '未设置'
+        date_label = CaptionLabel(date_text, self)
+        self.date_label = date_label
+        meta.addWidget(date_label)
+        local = CaptionLabel('本地', self)
+        local.setStyleSheet('color:#e5b45f;')
+        local.setToolTip('本地修改过的评分/短评/日期，同步时不会覆盖')
+        local.setVisible(bool(
+            record['date_overridden'] or record['rating_overridden']
+            or record['comment_overridden']
+        ))
+        self.local_label = local
+        meta.addWidget(local)
+        layout.addLayout(meta)
+
+        comment_label = CaptionLabel('', self)
+        comment_label.setWordWrap(True)
+        comment_metrics = QFontMetrics(comment_label.font())
+        comment_label.setFixedHeight(comment_metrics.lineSpacing() * 3 + 2)
+        self.comment_text = _elided_lines(
+            self.comment, comment_label.font(), 194, 3
+        )
+        comment_label.setTextColor('#5f6b7a', '#8d95a5')
+        comment_label.setToolTip(self.comment)
+        comment_label.setVisible(bool(self.comment))
+        self.comment_label = comment_label
+        layout.addWidget(comment_label)
+        layout.addStretch(1)
+        self.box = layout
+
+        actions = QHBoxLayout()
+        actions.setSpacing(2)
+        if record['status'] == 'wish':
+            type_text = '想看' if record['media_type'] == 'movie' else '想读'
+        else:
+            type_text = MEDIA_LABELS[record['media_type']]
+        type_label = CaptionLabel(type_text, self)
+        type_label.setStyleSheet('color:#e5b45f;')
+        self.type_label = type_label
+        actions.addWidget(type_label)
+        actions.addStretch(1)
+        cover_button = TransparentToolButton(FluentIcon.PHOTO, self)
+        cover_button.setIconSize(QSize(12, 12))
+        cover_button.setFixedSize(20, 20)
+        cover_button.setToolTip('更换封面')
+        cover_button.installEventFilter(ToolTipFilter(cover_button))
+        cover_button.clicked.connect(lambda: self.cover_requested.emit(int(record['id'])))
+        actions.addWidget(cover_button)
+        link_button = TransparentToolButton(FluentIcon.LINK, self)
+        link_button.setIconSize(QSize(12, 12))
+        link_button.setFixedSize(20, 20)
+        link_button.setToolTip('打开豆瓣条目')
+        link_button.installEventFilter(ToolTipFilter(link_button))
+        link_button.clicked.connect(lambda: self.link_requested.emit(record['url'] or ''))
+        actions.addWidget(link_button)
+        edit_button = TransparentToolButton(FluentIcon.EDIT, self)
+        edit_button.setIconSize(QSize(12, 12))
+        edit_button.setFixedSize(20, 20)
+        edit_button.setToolTip('编辑日期、评分与短评')
+        edit_button.installEventFilter(ToolTipFilter(edit_button))
+        edit_button.clicked.connect(lambda: self.edit_requested.emit(int(record['id'])))
+        actions.addWidget(edit_button)
+        delete_button = TransparentToolButton(FluentIcon.DELETE, self)
+        delete_button.setIconSize(QSize(12, 12))
+        delete_button.setFixedSize(20, 20)
+        delete_button.setToolTip('删除（移到回收站）')
+        delete_button.installEventFilter(ToolTipFilter(delete_button))
+        delete_button.clicked.connect(lambda: self.delete_requested.emit(int(record['id'])))
+        actions.addWidget(delete_button)
+        layout.addLayout(actions)
+        self.set_highlight(self.highlight)
+
+    def update_record(self, record, highlight: str = '', force_cover: bool = False) -> None:
+        old_cover = self.record['cover_path'] or ''
+        self.record = record
+        self.comment = record['comment'] or ''
+        self.box.setSpacing(7 if self.comment else 5)
+        if force_cover or (record['cover_path'] or '') != old_cover:
+            self.cover_label.setPixmap(
+                _cover_pixmap(record['cover_path'] or '', 194, 272)
+            )
+        self.title_text = _elided_lines(
+            record['title'] or '', self.title_label.font(), 194, 2
+        )
+        self.title_label.setToolTip(record['title'] or '')
+        if record['media_type'] == 'book':
+            stats = book_stats_text(
+                record['subject_id'], int(record['word_count'] or 0)
+            )
+        else:
+            stats = movie_stats_text(record['intro'] or '', record['subject_id'])
+        self.stats_label.setText(stats)
+        self.stats_label.setToolTip(record['book_file'] or '')
+        stars = int(record['rating'] or 0)
+        self.star_label.setText(
+            '★' * stars + '☆' * (5 - stars) if stars else '未评分'
+        )
+        self.date_label.setText(
+            record['effective_date'] or record['marked_date'] or '未设置'
+        )
+        self.local_label.setVisible(bool(
+            record['date_overridden'] or record['rating_overridden']
+            or record['comment_overridden']
+        ))
+        if record['status'] == 'wish':
+            type_text = '想看' if record['media_type'] == 'movie' else '想读'
+        else:
+            type_text = MEDIA_LABELS[record['media_type']]
+        self.type_label.setText(type_text)
+        if self.comment:
+            self.comment_text = _elided_lines(
+                self.comment, self.comment_label.font(), 194, 3
+            )
+            self.comment_label.setToolTip(self.comment)
+        else:
+            self.comment_text = ''
+        self.comment_label.setVisible(bool(self.comment))
+        self.set_highlight(highlight)
+
+    def set_highlight(self, keyword: str) -> None:
+        self.highlight = (keyword or '').strip()
+        self._set_label_text(self.title_label, self.title_text)
+        if self.comment_label is not None:
+            self._set_label_text(self.comment_label, self.comment_text)
+
+    def _set_label_text(self, label, text: str) -> None:
+        if self.highlight:
+            label.setTextFormat(Qt.RichText)
+            label.setText(_highlight_html(text, self.highlight))
+        else:
+            label.setTextFormat(Qt.PlainText)
+            label.setText(text)
+
+    def _normalBackgroundColor(self):
+        return QColor(255, 255, 255, 13 if isDarkTheme() else 235)
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.Antialiasing)
+        rect = self.rect().adjusted(0, 0, -1, -1)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(self.backgroundColor)
+        painter.drawRoundedRect(rect, self.borderRadius, self.borderRadius)
+        if not isDarkTheme():
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(15, 23, 42, 28), 1))
+            painter.drawRoundedRect(rect, self.borderRadius, self.borderRadius)
