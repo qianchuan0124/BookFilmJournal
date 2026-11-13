@@ -69,12 +69,16 @@ def _patch_calendar_months() -> None:
 
 
 def _log_uncaught(exc_type, exc_value, exc_tb) -> None:
+    if sys.stderr is None:
+        return
     traceback.print_exception(exc_type, exc_value, exc_tb)
     sys.stderr.flush()
 
 
 def main() -> None:
-    faulthandler.enable()
+    # 打包后的窗口程序没有控制台，sys.stderr 为 None，faulthandler 会直接抛错
+    if sys.stderr is not None:
+        faulthandler.enable()
     sys.excepthook = _log_uncaught
     QLocale.setDefault(QLocale(QLocale.Language.Chinese, QLocale.Country.China))
     _patch_calendar_months()

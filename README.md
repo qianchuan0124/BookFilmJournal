@@ -112,13 +112,17 @@ python main.py
 # macOS：生成 .app / .zip / .dmg
 ./packaging/build_macos.sh
 
-# Windows：生成便携目录版
+# Windows：生成便携目录、zip 与安装包（setup.exe）
 packaging\build_windows.bat
+
+# Windows：只生成便携目录与 zip
+packaging\build_windows.bat --portable-only
 ```
 
 - macOS App 约 565 MB，ZIP 约 204 MB，DMG 约 240–255 MB；体积主要来自 `QtWebEngineCore`（约 290 MB）及 Chromium 运行资源，用于内置扫码登录。
 - PyInstaller 不支持从 macOS 交叉编译 Windows 包，需要在 Windows 10/11 上执行。
-- Windows 便携包解压后运行 `ShuyingJilu.exe`；若需要安装程序，可再用 Inno Setup / NSIS 封装。
+- Windows 产物：便携目录 `dist\ShuyingJilu\`、便携 zip `dist\ShuyingJilu-windows-x64.zip`、安装包 `dist\ShuyingJilu-windows-x64-setup.exe`。
+- 安装包由 Inno Setup 6 编译（脚本 `packaging\ShuyingJilu.iss`），需先安装 Inno Setup 6 并确保 `ISCC.exe` 可用；安装到当前用户目录，无需管理员权限，安装时可选桌面快捷方式。
 
 ```bash
 pip install -r requirements-build.txt
@@ -260,7 +264,8 @@ GUIDE_PREVIEW_DIR=~/Desktop/preview .venv/bin/python tools/make_guide_images.py
 ├── packaging/
 │   ├── ShuyingJilu.spec        # PyInstaller 配置
 │   ├── build_macos.sh          # macOS .app / .dmg / .zip
-│   ├── build_windows.bat       # Windows 便携包
+│   ├── build_windows.bat       # Windows 便携包 / zip / 安装包
+│   ├── ShuyingJilu.iss         # Inno Setup 安装包脚本
 │   └── icon.*                  # 应用图标
 ├── requirements.txt            # 运行依赖
 ├── requirements-build.txt      # 打包依赖
