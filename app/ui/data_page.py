@@ -37,7 +37,7 @@ from qfluentwidgets import (
 
 from app.config import APP_VERSION_TEXT, OUTPUT_DIR, ROOT
 from app.db import Database
-from app.douban import fetch_cover
+from app.douban import cover_file_ok, fetch_cover
 from app.excel import ExcelError, default_export_name, export_excel, import_excel
 from app.profile import (
     DEFAULT_NAME,
@@ -570,7 +570,7 @@ class DataPage(QWidget):
                 path = Path(cover_path)
                 if not path.is_absolute():
                     path = ROOT / path
-                if path.exists() and path.stat().st_size > 500:
+                if cover_file_ok(path):
                     continue
             todo.append(row)
         if not todo:

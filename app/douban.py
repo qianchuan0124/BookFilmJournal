@@ -1,10 +1,12 @@
 import html
 import json
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import requests
 from bs4 import BeautifulSoup
@@ -380,30 +382,97 @@ def fetch_subject_detail(subject_id: str, media_type: str, cookie: str = '') -> 
     return detail
 
 
+_IMAGE_SIGNATURES = (
+    (0, b'\xff\xd8\xff'),        # JPEG
+    (0, b'\x89PNG\r\n\x1a\n'),   # PNG
+    (0, b'GIF87a'),
+    (0, b'GIF89a'),
+)
+
+# 同一张封面图在 img1/img2/img3/img9 上互为镜像。豆瓣会对个别域名返回反爬挑战页，
+# 换一个镜像域名通常就能拿到真图。
+_COVER_MIRRORS = ('img1.doubanio.com', 'img2.doubanio.com',
+                  'img3.doubanio.com', 'img9.doubanio.com')
+
+
+def _image_header_ok(head: bytes) -> bool:
+    return (any(head.startswith(sig) for offset, sig in _IMAGE_SIGNATURES if offset == 0)
+            or (head[:4] == b'RIFF' and head[8:12] == b'WEBP'))
+
+
+def _looks_like_image(data: bytes) -> bool:
+    """被反爬时豆瓣会返回 200 + 一段约 1 KB 的 JS 挑战页，只能靠文件头判断真伪。"""
+    return len(data) > 500 and _image_header_ok(data[:12])
+
+
+def cover_file_ok(path: Path) -> bool:
+    """本地已有的封面文件是否真的是图片（旧版本可能把挑战页存成了 .jpg）。"""
+    try:
+        if path.stat().st_size <= 500:
+            return False
+        with path.open('rb') as handle:
+            return _image_header_ok(handle.read(12))
+    except OSError:
+        return False
+
+
+def _cover_relative(path: Path) -> str:
+    try:
+        return str(path.relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _cover_mirrors(url: str) -> list[str]:
+    parts = urlsplit(url)
+    host = (parts.hostname or '').lower()
+    if not host.endswith('doubanio.com'):
+        return [url]
+    candidates = [url]
+    for mirror in _COVER_MIRRORS:
+        if mirror == host:
+            continue
+        candidates.append(urlunsplit(
+            (parts.scheme or 'https', mirror, parts.path, parts.query, '')
+        ))
+    return candidates
+
+
+def _fetch_cover_bytes(session: requests.Session, url: str, referer: str = '') -> bytes:
+    """按镜像依次尝试，只返回真正的图片内容。"""
+    if not url:
+        return b''
+    headers = {'User-Agent': _UA, 'Referer': referer or 'https://www.douban.com/'}
+    for candidate in _cover_mirrors(_upgrade_cover(url)):
+        try:
+            response = session.get(candidate, headers=headers, timeout=20)
+        except requests.RequestException:
+            continue
+        if response.status_code == 200 and _looks_like_image(response.content):
+            return response.content
+    return b''
+
+
+def _write_cover(path: Path, data: bytes) -> str:
+    COVERS_DIR.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + '.part')
+    temp.write_bytes(data)
+    os.replace(temp, path)
+    return _cover_relative(path)
+
+
 def fetch_cover(cover_url: str, media_type: str, subject_id: str, referer: str = '',
                 force: bool = False) -> str:
     url = _upgrade_cover(cover_url or '')
     if not url:
         return ''
     path = COVERS_DIR / f'{media_type}_{subject_id}.jpg'
-    if not force and path.exists() and path.stat().st_size > 500:
-        try:
-            return str(path.relative_to(ROOT))
-        except ValueError:
-            return str(path)
-    try:
-        response = requests.get(url, headers={'User-Agent': _UA, 'Referer': referer or 'https://www.douban.com/'},
-                                timeout=20)
-    except requests.RequestException:
+    if not force and cover_file_ok(path):
+        return _cover_relative(path)
+    data = _fetch_cover_bytes(requests.Session(), url, referer)
+    if not data:
         return ''
-    if response.status_code != 200 or len(response.content) <= 500:
-        return ''
-    COVERS_DIR.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(response.content)
-    try:
-        return str(path.relative_to(ROOT))
-    except ValueError:
-        return str(path)
+    return _write_cover(path, data)
 
 
 def fetch_collect(media_type: str, user_id: str, cookie: str = '',
@@ -503,25 +572,15 @@ def _download_cover(session: requests.Session, record: dict, index: int, total: 
         return ''
     filename = f"{record['media_type']}_{record['subject_id']}.jpg"
     path = COVERS_DIR / filename
-    if path.exists() and path.stat().st_size > 500:
-        try:
-            return str(path.relative_to(ROOT))
-        except ValueError:
-            return str(path)
-    try:
-        response = session.get(url, headers={'Referer': record.get('url', '')}, timeout=20)
-        if response.status_code == 200 and len(response.content) > 500:
-            COVERS_DIR.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(response.content)
-    except requests.RequestException:
+    if cover_file_ok(path):
+        return _cover_relative(path)
+    data = _fetch_cover_bytes(session, url, record.get('url', ''))
+    if not data:
         return ''
     if progress:
         progress(f'下载封面 {index}/{total}', index, total)
     time.sleep(0.2)
-    try:
-        return str(path.relative_to(ROOT))
-    except ValueError:
-        return str(path)
+    return _write_cover(path, data)
 
 
 def _download_covers(records: list[dict], session: requests.Session, label: str,

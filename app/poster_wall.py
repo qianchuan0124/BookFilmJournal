@@ -2,12 +2,12 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 import math
-import requests
 import zlib
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
-from app.config import COVERS_DIR, ROOT
+from app.config import ROOT
+from app.douban import cover_file_ok, fetch_cover
 
 TILE_RATIO = 1.5
 CELL_GAP = 8
@@ -21,8 +21,6 @@ TILE_BORDER = '#2a3242'
 POSTER_MAX_WIDTH = 4000
 POSTER_MAX_HEIGHT = 8000
 POSTER_JPEG_QUALITY = 88
-COVER_UA = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
-            'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36')
 PLACEHOLDER_COLORS = ('#1b2230', '#202a35', '#2a2230', '#1f2a26', '#2a2720')
 FONT_CANDIDATES = (
     '/System/Library/Fonts/PingFang.ttc',
@@ -42,29 +40,18 @@ def _local_cover(item) -> Optional[Path]:
         path = Path(cover)
         if not path.is_absolute():
             path = ROOT / path
-        if path.exists() and path.stat().st_size > 500:
+        if cover_file_ok(path):
             return path
     cover_url = getattr(item, 'cover_url', '') or ''
     if not cover_url:
         return None
     media_type = getattr(item, 'media_type', '') or 'image'
     subject_id = getattr(item, 'subject_id', '') or str(abs(hash(cover_url)))
-    target = COVERS_DIR / f'{media_type}_{subject_id}.jpg'
-    if target.exists() and target.stat().st_size > 500:
-        return target
-    try:
-        response = requests.get(
-            cover_url,
-            headers={'User-Agent': COVER_UA, 'Referer': 'https://www.douban.com/'},
-            timeout=20,
-        )
-    except requests.RequestException:
+    saved = fetch_cover(cover_url, media_type, subject_id)
+    if not saved:
         return None
-    if response.status_code != 200 or len(response.content) <= 500:
-        return None
-    COVERS_DIR.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(response.content)
-    return target
+    path = Path(saved)
+    return path if path.is_absolute() else ROOT / path
 
 
 def _load_image(item) -> Optional[Image.Image]:
