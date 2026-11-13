@@ -19,7 +19,6 @@ from qfluentwidgets import (
 from app.config import MEDIA_NOUNS, PLANS_DIR, READ_LABELS
 from app.db import Database
 from app.media_meta import book_stats_text, movie_stats_text
-from app.plan_export import export_plan_png
 from app.profile import effective_name
 from app.ui.read_stamp import ReadStamp
 from app.ui.segmented import SegmentedSwitch
@@ -539,7 +538,8 @@ class PlanPage(QWidget):
         self.stack.addWidget(self.outer_page)
         self.stack.addWidget(self.detail_page)
         root.addWidget(self.stack, 1)
-        self.refresh()
+        # 首次显示时再加载计划，避免启动阶段无谓构建。
+        self._dirty = True
 
     def _build_outer_page(self) -> QWidget:
         page = QWidget(self)
@@ -841,6 +841,8 @@ class PlanPage(QWidget):
             path += '.png'
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
+            from app.plan_export import export_plan_png
+
             result = export_plan_png(
                 self.db, folder, self.media_type, Path(path),
                 effective_name(self.db),

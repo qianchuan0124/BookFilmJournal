@@ -128,8 +128,6 @@ class RecyclePage(QWidget):
         self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll, 1)
 
-        self.refresh()
-
     def _clear(self) -> None:
         while self.content_layout.count():
             item = self.content_layout.takeAt(0)

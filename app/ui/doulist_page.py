@@ -298,7 +298,8 @@ class DoulistPage(QWidget):
         self.stack.addWidget(self.detail_page)
         root.addWidget(self.stack, 1)
 
-        self.refresh()
+        # 首次显示时再加载豆列，避免启动阶段构建全部卡片。
+        self._dirty = True
 
     def _build_outer_page(self) -> QWidget:
         page = QWidget(self)

@@ -32,6 +32,11 @@ class RecordsPage(QWidget):
     synced = Signal(dict)
     record_changed = Signal(str)
 
+    # 首屏同步创建少量卡片，其余在事件循环空闲时分批补齐。
+    _INITIAL_CARDS = 24
+    _WARMUP_CARDS = 8
+    _BATCH_CARDS = 8
+
     def __init__(self, db: Database, media_type: str, parent=None):
         super().__init__(parent)
         self.db = db
@@ -41,6 +46,8 @@ class RecordsPage(QWidget):
         self._saved_scroll = 0
         self._saved_height = 0
         self._had_search = False
+        self._restore_scroll = 0
+        self._pump_scheduled_for = None
         self.status = 'done'
         self.cards: list[RecordCard] = []
         self._groups = []
@@ -122,7 +129,8 @@ class RecordsPage(QWidget):
         self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll, 1)
 
-        self.refresh()
+        # 首次显示时再加载记录，避免启动阶段构建全部卡片。
+        self._dirty = True
 
     def _on_search(self, text: str) -> None:
         self.search_text = (text or '').strip().lower()
@@ -160,7 +168,7 @@ class RecordsPage(QWidget):
         card.cover_requested.connect(self.change_cover)
         return card
 
-    def _build_view(self, status: str) -> dict:
+    def _build_view(self, status: str, initial_cards: int = None) -> dict:
         widget = QWidget(self.container)
         widget.setStyleSheet('background:transparent;')
         box = QVBoxLayout(widget)
@@ -169,6 +177,7 @@ class RecordsPage(QWidget):
         cards: list[RecordCard] = []
         groups = []
         lines = []
+        pending = []
         for date_str, rows in self.db.grouped_records(self.media_type, status):
             header = QWidget(widget)
             header_layout = QHBoxLayout(header)
@@ -176,7 +185,7 @@ class RecordsPage(QWidget):
             header_layout.setSpacing(10)
             date_label = StrongBodyLabel(_date_heading(date_str), header)
             header_layout.addWidget(date_label)
-            count = CaptionLabel(f'0 {MEDIA_NOUNS[self.media_type]}', header)
+            count = CaptionLabel(f'{len(rows)} {MEDIA_NOUNS[self.media_type]}', header)
             count.setTextColor('#5f6b7a', '#8d95a5')
             header_layout.addWidget(count)
             header_layout.addStretch(1)
@@ -189,18 +198,17 @@ class RecordsPage(QWidget):
 
             group_widget = QWidget(widget)
             group_widget.setStyleSheet('background:transparent;')
+            group_widget.setProperty('totalRows', len(rows))
             flow = FlowLayout(group_widget, needAni=False, isTight=True)
             flow.setContentsMargins(0, 0, 0, 0)
             flow.setHorizontalSpacing(14)
             flow.setVerticalSpacing(14)
             group_cards = []
-            for row in rows:
-                card = self._make_card(row, group_widget)
-                flow.addWidget(card)
-                cards.append(card)
-                group_cards.append((card, row))
             box.addWidget(group_widget)
             groups.append((header, count, group_widget, group_cards, date_str))
+            pending.append({
+                'flow': flow, 'rows': list(rows), 'cards': group_cards, 'group': group_widget,
+            })
 
         empty_label = BodyLabel('', widget)
         empty_label.setAlignment(Qt.AlignCenter)
@@ -208,10 +216,68 @@ class RecordsPage(QWidget):
         box.addWidget(empty_label)
         box.addStretch(1)
         self.content_layout.addWidget(widget)
-        return {
+        view = {
             'widget': widget, 'cards': cards, 'groups': groups, 'empty': empty_label,
-            'lines': lines,
+            'lines': lines, 'pending': pending,
         }
+        budget = self._INITIAL_CARDS if initial_cards is None else initial_cards
+        self._add_cards(view, budget)
+        return view
+
+    def _add_cards(self, view: dict, budget: int) -> int:
+        """按预算补充卡片，返回仍未创建的条目数。"""
+        pending = view['pending']
+        keyword = self.search_text
+        built = 0
+        while pending and built < budget:
+            entry = pending[0]
+            row = entry['rows'].pop(0)
+            card = self._make_card(row, entry['group'])
+            entry['flow'].addWidget(card)
+            entry['cards'].append((card, row))
+            view['cards'].append(card)
+            if keyword:
+                matched = keyword in f"{row['title']} {row['comment']}".lower()
+                self._set_visible(card, matched)
+                if matched:
+                    card.set_highlight(keyword)
+            if not entry['rows']:
+                pending.pop(0)
+            built += 1
+        return len(pending)
+
+    def _pump(self, view: dict) -> None:
+        if self._pump_scheduled_for is view:
+            self._pump_scheduled_for = None
+        if view is not self.current_view or not self.isVisible():
+            return
+        if self._add_cards(view, self._BATCH_CARDS):
+            self._schedule_pump(view)
+            return
+        self._restore_scroll_if_needed()
+        self._schedule_warmup()
+
+    def _schedule_pump(self, view: dict, delay: int = 0) -> None:
+        if view is not self.current_view or self._pump_scheduled_for is view:
+            return
+        self._pump_scheduled_for = view
+        QTimer.singleShot(delay, lambda: self._pump(view))
+
+    def _flush_pending(self) -> None:
+        view = self.current_view
+        if view is None:
+            return
+        while view['pending']:
+            self._add_cards(view, self._BATCH_CARDS * 8)
+
+    def _restore_scroll_if_needed(self) -> None:
+        target = self._restore_scroll
+        self._restore_scroll = 0
+        if not target:
+            return
+        bar = self.scroll.verticalScrollBar()
+        if bar.value() == 0:
+            self._set_scroll(min(target, bar.maximum()))
 
     @staticmethod
     def _divider_color() -> str:
@@ -235,10 +301,12 @@ class RecordsPage(QWidget):
         self._groups = view['groups']
         self.empty_label = view['empty']
         self._apply_search(reset_scroll=reset_scroll)
-        self._schedule_warmup()
+        self._schedule_pump(view, delay=24)
 
     def _schedule_warmup(self) -> None:
         if len(self.views) >= 2 or not self.isVisible():
+            return
+        if self.current_view is not None and self.current_view['pending']:
             return
         QTimer.singleShot(600, self._warm_up)
 
@@ -248,7 +316,7 @@ class RecordsPage(QWidget):
         other = 'wish' if self.status == 'done' else 'done'
         if other in self.views:
             return
-        view = self._build_view(other)
+        view = self._build_view(other, initial_cards=self._WARMUP_CARDS)
         view['widget'].setVisible(False)
         self.views[other] = view
 
@@ -258,6 +326,8 @@ class RecordsPage(QWidget):
             self._dirty = False
             self.refresh()
         self._reflow()
+        if self.current_view is not None:
+            self._schedule_pump(self.current_view)
         self._schedule_warmup()
 
     def mark_dirty(self) -> None:
@@ -270,12 +340,10 @@ class RecordsPage(QWidget):
         bar = self.scroll.verticalScrollBar()
         scroll = bar.value()
         self._clear()
+        self._restore_scroll = scroll
         self._show_status(self.status, reset_scroll=False)
-        if scroll:
-            self._set_scroll(min(scroll, bar.maximum()))
-            QTimer.singleShot(
-                0, lambda: self._set_scroll(min(scroll, bar.maximum()))
-            )
+        if self.current_view is not None and not self.current_view['pending']:
+            self._restore_scroll_if_needed()
 
     def update_record(self, record_id: int, force_cover: bool = False) -> None:
         row = self.db.get_record(record_id)
@@ -306,21 +374,32 @@ class RecordsPage(QWidget):
         keyword = self.search_text
         was_search = self._had_search
         clearing = not keyword and was_search
+        if keyword or clearing:
+            # 搜索/清空搜索需要完整卡片集合，先把分批加载补齐。
+            self._restore_scroll = 0
+            self._flush_pending()
         if keyword and not was_search:
             self._saved_scroll = self.scroll.verticalScrollBar().value()
             self._saved_height = self.container.height()
         total = 0
         for header, count_label, group_widget, cards, _ in self._groups:
-            visible = 0
-            for card, row in cards:
-                matched = not keyword or keyword in f"{row['title']} {row['comment']}".lower()
-                self._set_visible(card, matched)
-                if keyword and matched:
-                    card.set_highlight(keyword)
-                elif card.highlight:
-                    card.set_highlight('')
-                if matched:
-                    visible += 1
+            if keyword:
+                visible = 0
+                for card, row in cards:
+                    matched = keyword in f"{row['title']} {row['comment']}".lower()
+                    self._set_visible(card, matched)
+                    if matched:
+                        card.set_highlight(keyword)
+                    elif card.highlight:
+                        card.set_highlight('')
+                    if matched:
+                        visible += 1
+            else:
+                visible = int(group_widget.property('totalRows') or 0)
+                for card, _row in cards:
+                    self._set_visible(card, True)
+                    if card.highlight:
+                        card.set_highlight('')
             count_label.setText(f'{visible} {MEDIA_NOUNS[self.media_type]}')
             self._set_visible(header, visible > 0)
             self._set_visible(group_widget, visible > 0)
@@ -359,6 +438,8 @@ class RecordsPage(QWidget):
 
     def _jump_to_date(self, value) -> None:
         target = value.toString('yyyy-MM-dd')
+        self._restore_scroll = 0
+        self._flush_pending()
         entries = [group for group in self._groups if not group[0].isHidden()]
         if not entries:
             return

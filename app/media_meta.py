@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import html
 import json
 import os
@@ -5,8 +7,6 @@ import re
 import time
 from functools import lru_cache
 from typing import Callable, Optional
-
-import requests
 
 from app.config import BOOK_META_CACHE, MOVIE_META_CACHE
 from app.words import format_word_count
@@ -207,6 +207,8 @@ def _write_json(path, data: dict) -> None:
 
 
 def _fetch_movie_mobile(session: requests.Session, subject_id: str) -> Optional[dict]:
+    import requests
+
     try:
         response = session.get(
             f'https://m.douban.com/movie/subject/{subject_id}/',
@@ -238,6 +240,8 @@ def _meta_is_complete(media_type: str, entry: Optional[dict]) -> bool:
 def ensure_subject_meta(media_type: str, subjects,
                         progress: Optional[Callable[[str, int, int], None]] = None,
                         delay: float = 1.0) -> dict:
+    import requests
+
     if media_type not in ('book', 'movie'):
         raise ValueError('media_type must be book or movie')
     cache_path = BOOK_META_CACHE if media_type == 'book' else MOVIE_META_CACHE

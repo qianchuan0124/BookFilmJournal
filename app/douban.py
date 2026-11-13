@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import html
 import json
 import os
@@ -7,9 +9,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.parse import urljoin, urlsplit, urlunsplit
-
-import requests
-from bs4 import BeautifulSoup
 
 from app.config import AVATAR_DIR, CACHE_DIR, COVERS_DIR, MEDIA_LABELS, ROOT
 from app.db import Database
@@ -52,6 +51,8 @@ def extract_user_id_from_cookie(cookie: str) -> str:
 
 
 def _parse_page(html_text: str, media_type: str) -> list[dict]:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(html_text, 'html.parser')
     nodes = soup.select('li.subject-item') or soup.select('div.item')
     records = []
@@ -98,6 +99,8 @@ def _parse_page(html_text: str, media_type: str) -> list[dict]:
 
 def _request(session: requests.Session, url: str, headers: dict, timeout: float = 20,
              retries: int = 2) -> requests.Response:
+    import requests
+
     for attempt in range(retries + 1):
         try:
             response = session.get(url, headers=headers, timeout=timeout)
@@ -284,6 +287,8 @@ def _info_value(info_text: str, label: str, stop_labels: tuple[str, ...]) -> str
 
 
 def _detail_from_html(html_text: str, subject_id: str, media_type: str) -> dict:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(html_text, 'html.parser')
     title_node = (soup.select_one('h1 span[property="v:itemreviewed"]')
                   or soup.select_one('h1'))
@@ -355,6 +360,8 @@ def parse_duration_from_text(text: str) -> Optional[int]:
 
 
 def fetch_subject_detail(subject_id: str, media_type: str, cookie: str = '') -> dict:
+    import requests
+
     subject_id = str(subject_id or '').strip()
     if not subject_id.isdigit():
         raise DoubanError('豆瓣链接中的条目 ID 无效。')
@@ -440,6 +447,8 @@ def _cover_mirrors(url: str) -> list[str]:
 
 def _fetch_cover_bytes(session: requests.Session, url: str, referer: str = '') -> bytes:
     """按镜像依次尝试，只返回真正的图片内容。"""
+    import requests
+
     if not url:
         return b''
     headers = {'User-Agent': _UA, 'Referer': referer or 'https://www.douban.com/'}
@@ -463,6 +472,8 @@ def _write_cover(path: Path, data: bytes) -> str:
 
 def fetch_cover(cover_url: str, media_type: str, subject_id: str, referer: str = '',
                 force: bool = False) -> str:
+    import requests
+
     url = _upgrade_cover(cover_url or '')
     if not url:
         return ''
@@ -479,6 +490,8 @@ def fetch_collect(media_type: str, user_id: str, cookie: str = '',
                   progress: Optional[Callable[[str, int, int], None]] = None,
                   kind: str = 'collect', allow_empty: bool = False
                   ) -> tuple[list[dict], str, str]:
+    import requests
+
     profile_url = f'https://{media_type}.douban.com/people/{user_id}/'
     headers = {'User-Agent': _UA, 'Referer': profile_url}
     if cookie.strip():
@@ -515,6 +528,8 @@ def fetch_collect(media_type: str, user_id: str, cookie: str = '',
 
 
 def _parse_profile_name(html_text: str) -> str:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(html_text, 'html.parser')
     avatar = soup.select_one('#db-usr-profile .pic img')
     text = (avatar.get('alt') or '').strip() if avatar else ''
@@ -531,6 +546,8 @@ def _parse_profile_name(html_text: str) -> str:
 
 
 def _parse_profile_avatar(html_text: str) -> str:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(html_text, 'html.parser')
     for selector in ('#db-usr-profile .pic img', '.user-info .pic img',
                      'img.avatar'):
@@ -595,6 +612,8 @@ def _download_covers(records: list[dict], session: requests.Session, label: str,
 
 
 def _parse_doulist_links(html_text: str, relation: str) -> list[dict]:
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(html_text, 'html.parser')
     found = []
     for link in soup.select('a[href*="/doulist/"]'):
@@ -616,6 +635,8 @@ def _parse_doulist_links(html_text: str, relation: str) -> list[dict]:
 
 def _collect_doulist_page(url: str, relation: str, session: requests.Session,
                           headers: dict, found: dict, max_pages: int = 10) -> None:
+    from bs4 import BeautifulSoup
+
     current = url
     for _ in range(max_pages):
         try:
@@ -698,6 +719,9 @@ def _fetch_rexxar_user_doulists(session: requests.Session, headers: dict,
 
 
 def fetch_user_doulists(user_id: str, cookie: str) -> list[dict]:
+    import requests
+    from bs4 import BeautifulSoup
+
     if not cookie.strip():
         raise DoubanError('豆列页面需要登录 Cookie，请在同步窗口填写 Cookie。')
     session = requests.Session()
@@ -753,6 +777,8 @@ def fetch_user_doulists(user_id: str, cookie: str) -> list[dict]:
 
 def fetch_doulist_items(douban_id: str, cookie: str = '',
                         progress: Optional[Callable[[str, int, int], None]] = None) -> tuple[list[dict], int]:
+    import requests
+
     session = requests.Session()
     session.headers.update({'User-Agent': _UA_MOBILE})
     is_collection = not str(douban_id).isdigit()
@@ -816,6 +842,8 @@ def sync_to_db(media_types: list[str], user_id: str, cookie: str, db: Database,
                progress: Optional[Callable[[str, int, int], None]] = None,
                include_wish: bool = False, include_doulists: bool = False,
                sync_mode: str = 'full') -> dict:
+    import requests
+
     if sync_mode not in ('full', 'incremental_add', 'incremental_sync'):
         raise ValueError(f'unknown sync mode: {sync_mode}')
     session = requests.Session()

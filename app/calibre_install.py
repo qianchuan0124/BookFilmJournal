@@ -6,8 +6,6 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Optional
 
-import requests
-
 from app.words import find_calibre
 
 RELEASE_API = 'https://api.github.com/repos/kovidgoyal/calibre/releases/latest'
@@ -29,6 +27,8 @@ def _asset_name(platform: str, version: str) -> str:
 
 
 def _release_url(platform: str) -> str:
+    import requests
+
     try:
         response = requests.get(RELEASE_API, timeout=20, headers={'User-Agent': UA})
         response.raise_for_status()
@@ -64,6 +64,8 @@ def _release_url(platform: str) -> str:
 
 
 def _download(url: str, target: Path, progress: Optional[Progress]) -> None:
+    import requests
+
     try:
         response = requests.get(
             url, stream=True, timeout=60,

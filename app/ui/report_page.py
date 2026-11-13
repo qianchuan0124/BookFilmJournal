@@ -16,7 +16,6 @@ from qfluentwidgets import (
 from app.config import DB_PATH, REPORTS_DIR
 from app.db import Database
 from app.profile import effective_name
-from app.reports import generate_report, render_png
 from app.ui.styles import primary_button
 
 SCOPE_MONTH = '指定月份'
@@ -43,6 +42,8 @@ class ReportWorker(QThread):
         self.theme = theme
 
     def run(self) -> None:
+        from app.reports import generate_report
+
         try:
             db = Database(DB_PATH)
             result = generate_report(
@@ -69,6 +70,8 @@ class BatchReportWorker(QThread):
         self.theme = theme
 
     def run(self) -> None:
+        from app.reports import generate_report
+
         try:
             db = Database(DB_PATH)
             results = []
@@ -151,6 +154,7 @@ class ReportPage(QWidget):
         self.worker = None
         self.recent_path = ''
         self._dirty = False
+        self._initialized = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(32, 26, 32, 26)
@@ -284,6 +288,7 @@ class ReportPage(QWidget):
         reports_layout.addWidget(self.reports_scroll)
         layout.addWidget(reports_card, 1)
 
+    def _initial_refresh(self) -> None:
         self.refresh_months()
         self._on_scope_changed()
         self._set_default_range()
@@ -569,6 +574,8 @@ class ReportPage(QWidget):
 
     def _on_generated(self, result: dict) -> None:
         if self.png_checkbox.isChecked() and result.get('html'):
+            from app.reports import render_png
+
             self.status.setText('正在导出 PNG…')
             QApplication.processEvents()
             QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -628,7 +635,10 @@ class ReportPage(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        if self._dirty:
+        if not self._initialized:
+            self._initialized = True
+            self._initial_refresh()
+        elif self._dirty:
             self._dirty = False
             self.refresh_all()
 

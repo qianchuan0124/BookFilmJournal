@@ -283,7 +283,8 @@ class DataPage(QWidget):
         layout.addWidget(about_card)
 
         layout.addStretch(1)
-        self.refresh()
+        # 首次显示时再读取设置页数据，避免启动阶段无谓查询。
+        self._dirty = True
 
     def _build_account_card(self, layout: QVBoxLayout) -> None:
         card = CardWidget(self)

@@ -33,6 +33,7 @@ from qfluentwidgets.components.date_time.calendar_view import DayScrollView, Mon
 
 from app.db import Database
 from app.profile import migrate_legacy_profile
+from app.single_instance import acquire as acquire_single_instance
 from app.ui.main_window import MainWindow
 from app.ui.styles import install_flat_buttons
 
@@ -80,6 +81,8 @@ def main() -> None:
     if sys.stderr is not None:
         faulthandler.enable()
     sys.excepthook = _log_uncaught
+    if not acquire_single_instance():
+        return
     QLocale.setDefault(QLocale(QLocale.Language.Chinese, QLocale.Country.China))
     _patch_calendar_months()
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts)

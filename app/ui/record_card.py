@@ -1,10 +1,13 @@
 import re
+from collections import OrderedDict
 from functools import lru_cache
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QPainter, QPen, QPixmap, QTextLayout
+from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal
+from PySide6.QtGui import (
+    QColor, QFontMetrics, QImage, QPainter, QPen, QPixmap, QTextLayout,
+)
 from PySide6.QtGui import QTextOption
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout
 
@@ -13,7 +16,7 @@ from qfluentwidgets import (
     TransparentToolButton, ToolTipFilter, isDarkTheme,
 )
 
-from app.config import MEDIA_LABELS, ROOT
+from app.config import CACHE_DIR, MEDIA_LABELS, ROOT
 from app.media_meta import book_stats_text, movie_stats_text
 
 
@@ -99,6 +102,14 @@ def _cover_pixmap(path: str, width: int, height: int, fill: bool = False) -> QPi
         stamp = full.stat().st_mtime_ns
     except OSError:
         stamp = 0
+    thumb = _thumb_path(full, width, height, fill)
+    try:
+        if thumb.exists() and thumb.stat().st_mtime_ns >= stamp:
+            cached = QPixmap(str(thumb))
+            if not cached.isNull():
+                return cached
+    except OSError:
+        pass
     return _scaled_cover(str(full), width, height, fill, stamp)
 
 
@@ -106,6 +117,123 @@ def _empty_pixmap(width: int, height: int) -> QPixmap:
     canvas = QPixmap(width, height)
     canvas.fill(QColor('#0f131b'))
     return canvas
+
+
+_THUMB_DIR = CACHE_DIR / 'cover_thumbs'
+_PIXMAP_CACHE_LIMIT = 400
+
+
+def _thumb_path(full: Path, width: int, height: int, fill: bool) -> Path:
+    tag = f'{width}x{height}{"f" if fill else ""}'
+    return _THUMB_DIR / tag / f'{full.stem}.jpg'
+
+
+def _render_cover_image(full: Path, width: int, height: int, fill: bool) -> QImage:
+    """在工作线程中生成（或读取已缓存的）缩略图。"""
+    thumb = _thumb_path(full, width, height, fill)
+    try:
+        source_stamp = full.stat().st_mtime_ns
+    except OSError:
+        return QImage()
+    try:
+        if thumb.exists() and thumb.stat().st_mtime_ns >= source_stamp:
+            cached = QImage(str(thumb))
+            if not cached.isNull():
+                return cached
+    except OSError:
+        pass
+    image = QImage(str(full))
+    if image.isNull():
+        return image
+    mode = Qt.KeepAspectRatioByExpanding if fill else Qt.KeepAspectRatio
+    scaled = image.scaled(width, height, mode, Qt.SmoothTransformation)
+    canvas = QImage(width, height, QImage.Format_ARGB32_Premultiplied)
+    canvas.fill(QColor('#0f131b'))
+    painter = QPainter(canvas)
+    painter.drawImage((width - scaled.width()) // 2, (height - scaled.height()) // 2,
+                      scaled)
+    painter.end()
+    try:
+        thumb.parent.mkdir(parents=True, exist_ok=True)
+        canvas.save(str(thumb), 'JPEG', 88)
+    except OSError:
+        pass
+    return canvas
+
+
+class _CoverSignals(QObject):
+    ready = Signal(str, int, int, QImage)
+
+
+class _CoverTask(QRunnable):
+    def __init__(self, key: str, full: Path, width: int, height: int, fill: bool,
+                 signals: _CoverSignals):
+        super().__init__()
+        self.key = key
+        self.full = full
+        self.width = width
+        self.height = height
+        self.fill = fill
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            image = _render_cover_image(self.full, self.width, self.height, self.fill)
+            self.signals.ready.emit(self.key, self.width, self.height, image)
+        except RuntimeError:
+            pass
+
+
+_cover_signals = None
+_cover_pool = None
+_pixmap_cache: OrderedDict = OrderedDict()
+_pending_requests: dict[str, list] = {}
+
+
+def _ensure_cover_loader() -> None:
+    global _cover_signals, _cover_pool
+    if _cover_signals is None:
+        _cover_signals = _CoverSignals()
+        _cover_signals.ready.connect(_on_cover_ready)
+        _cover_pool = QThreadPool.globalInstance()
+
+
+def _on_cover_ready(key: str, width: int, height: int, image: QImage) -> None:
+    callbacks = _pending_requests.pop(key, [])
+    pixmap = _empty_pixmap(width, height) if image.isNull() else QPixmap.fromImage(image)
+    _pixmap_cache[key] = pixmap
+    _pixmap_cache.move_to_end(key)
+    while len(_pixmap_cache) > _PIXMAP_CACHE_LIMIT:
+        _pixmap_cache.popitem(last=False)
+    for callback in callbacks:
+        try:
+            callback(pixmap)
+        except RuntimeError:
+            pass
+
+
+def request_cover(path: str, width: int, height: int, fill, callback) -> None:
+    """异步获取封面缩略图；先返回占位图，解码完成后回调。"""
+    if not path:
+        callback(_empty_pixmap(width, height))
+        return
+    full = Path(path)
+    if not full.is_absolute():
+        full = ROOT / full
+    if not full.exists():
+        callback(_empty_pixmap(width, height))
+        return
+    key = f'{full}|{width}x{height}|{int(bool(fill))}'
+    cached = _pixmap_cache.get(key)
+    if cached is not None:
+        _pixmap_cache.move_to_end(key)
+        callback(cached)
+        return
+    callbacks = _pending_requests.setdefault(key, [])
+    callbacks.append(callback)
+    if len(callbacks) == 1:
+        _ensure_cover_loader()
+        _cover_pool.start(_CoverTask(key, full, width, height, fill, _cover_signals))
 
 
 @lru_cache(maxsize=600)
@@ -156,10 +284,11 @@ class RecordCard(CardWidget):
         cover = QLabel(self)
         cover.setFixedSize(194, 272)
         cover.setAlignment(Qt.AlignCenter)
-        cover.setPixmap(_cover_pixmap(record['cover_path'] or '', 194, 272))
+        cover.setPixmap(_empty_pixmap(194, 272))
         cover.setStyleSheet('background:#0f131b; border-radius:7px;')
         self.cover_label = cover
         layout.addWidget(cover)
+        self._request_cover(record['cover_path'] or '')
 
         title = StrongBodyLabel('', self)
         title.setWordWrap(True)
@@ -261,15 +390,27 @@ class RecordCard(CardWidget):
         layout.addLayout(actions)
         self.set_highlight(self.highlight)
 
+    def _request_cover(self, path: str) -> None:
+        request_cover(
+            path, 194, 272, False,
+            lambda pixmap, target=path: self._apply_cover(target, pixmap),
+        )
+
+    def _apply_cover(self, path: str, pixmap: QPixmap) -> None:
+        if (self.record['cover_path'] or '') != path:
+            return
+        try:
+            self.cover_label.setPixmap(pixmap)
+        except RuntimeError:
+            pass
+
     def update_record(self, record, highlight: str = '', force_cover: bool = False) -> None:
         old_cover = self.record['cover_path'] or ''
         self.record = record
         self.comment = record['comment'] or ''
         self.box.setSpacing(7 if self.comment else 5)
         if force_cover or (record['cover_path'] or '') != old_cover:
-            self.cover_label.setPixmap(
-                _cover_pixmap(record['cover_path'] or '', 194, 272)
-            )
+            self._request_cover(record['cover_path'] or '')
         self.title_text = _elided_lines(
             record['title'] or '', self.title_label.font(), 194, 2
         )
