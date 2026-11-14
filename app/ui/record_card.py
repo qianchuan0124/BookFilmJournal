@@ -279,7 +279,7 @@ class RecordCard(CardWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(7 if self.comment else 5)
+        layout.setSpacing(7)
 
         cover = QLabel(self)
         cover.setFixedSize(194, 272)
@@ -342,7 +342,8 @@ class RecordCard(CardWidget):
         )
         comment_label.setTextColor('#5f6b7a', '#8d95a5')
         comment_label.setToolTip(self.comment)
-        comment_label.setVisible(bool(self.comment))
+        # 没有短评时也保留这段高度，保证所有卡片等高，批量加载时不会忽高忽低。
+        comment_label.setVisible(True)
         self.comment_label = comment_label
         layout.addWidget(comment_label)
         layout.addStretch(1)
@@ -389,6 +390,8 @@ class RecordCard(CardWidget):
         actions.addWidget(delete_button)
         layout.addLayout(actions)
         self.set_highlight(self.highlight)
+        # 固定高度，避免卡片刚加入布局时先以默认高度显示、随后再被撑开。
+        self.setFixedHeight(self.sizeHint().height())
 
     def _request_cover(self, path: str) -> None:
         request_cover(
@@ -408,7 +411,7 @@ class RecordCard(CardWidget):
         old_cover = self.record['cover_path'] or ''
         self.record = record
         self.comment = record['comment'] or ''
-        self.box.setSpacing(7 if self.comment else 5)
+        self.box.setSpacing(7)
         if force_cover or (record['cover_path'] or '') != old_cover:
             self._request_cover(record['cover_path'] or '')
         self.title_text = _elided_lines(
@@ -446,7 +449,7 @@ class RecordCard(CardWidget):
             self.comment_label.setToolTip(self.comment)
         else:
             self.comment_text = ''
-        self.comment_label.setVisible(bool(self.comment))
+        self.comment_label.setVisible(True)
         self.set_highlight(highlight)
 
     def set_highlight(self, keyword: str) -> None:

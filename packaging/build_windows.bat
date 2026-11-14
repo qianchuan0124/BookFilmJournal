@@ -30,10 +30,10 @@ if not exist "dist\ShuyingJilu\ShuyingJilu.exe" (
   exit /b 1
 )
 
-set ZIP=dist\ShuyingJilu-windows-x64.zip
+set ZIP=dist\ShuyingJilu-win.zip
 if exist "%ZIP%" del /f /q "%ZIP%"
 rem Compress-Archive 在文件被占用时会静默失败，改用 .NET ZipFile 并在出错时返回非零退出码
-powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory('%CD%\dist\ShuyingJilu','%CD%\dist\ShuyingJilu-windows-x64.zip',[System.IO.Compression.CompressionLevel]::Optimal,$false)"
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory('%CD%\dist\ShuyingJilu','%CD%\dist\ShuyingJilu-win.zip',[System.IO.Compression.CompressionLevel]::Optimal,$false)"
 if errorlevel 1 exit /b 1
 if not exist "%ZIP%" (
   echo 未生成 Windows 便携包：%ZIP%
@@ -62,8 +62,8 @@ for /f "usebackq delims=" %%v in (`".venv\Scripts\python.exe" -c "import sys;sys
 "%ISCC%" /DMyAppVersion=%APP_VERSION% packaging\ShuyingJilu.iss
 if errorlevel 1 exit /b 1
 
-if not exist "dist\ShuyingJilu-windows-x64-setup.exe" (
-  echo 未生成 Windows 安装包：dist\ShuyingJilu-windows-x64-setup.exe
+if not exist "dist\ShuyingJilu-win.setup.exe" (
+  echo 未生成 Windows 安装包：dist\ShuyingJilu-win.setup.exe
   exit /b 1
 )
-echo Windows 安装包已生成：dist\ShuyingJilu-windows-x64-setup.exe
+echo Windows 安装包已生成：dist\ShuyingJilu-win.setup.exe

@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from app.config import MEDIA_NOUNS, READ_LABELS, ROOT
 from app.db import Database
-from app.media_meta import book_stats_text, movie_stats_text
+from app.media_meta import book_stats_text_full, movie_stats_text
 
 WIDTH = 1240
 PADDING = 64
@@ -140,8 +140,8 @@ def export_plan_png(db: Database, folder, media_type: str, output_path: Path,
     rows = []
     for position, item in enumerate(items, 1):
         if item['media_type'] == 'book':
-            stats = book_stats_text(item['subject_id'],
-                                    word_counts.get(str(item['subject_id']), 0))
+            stats = book_stats_text_full(
+                item['subject_id'], word_counts.get(str(item['subject_id']), 0))
         elif item['media_type'] == 'movie':
             stats = movie_stats_text(
                 movie_intros.get(str(item['subject_id']), '') or item['intro'] or '',

@@ -20,6 +20,8 @@ class MainWindow(FluentWindow):
         self.db = db or Database()
         self.setWindowTitle('书影记录')
         self.resize(1280, 860)
+        # 关闭页面切换时的上滑动画，避免切换后页面先偏下再跳到顶部。
+        self.stackedWidget.setAnimationEnabled(False)
 
         self.movie_page = RecordsPage(self.db, 'movie', self)
         self.book_page = RecordsPage(self.db, 'book', self)

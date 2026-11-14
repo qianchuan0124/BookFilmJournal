@@ -18,7 +18,7 @@ from qfluentwidgets import (
 
 from app.config import MEDIA_NOUNS, PLANS_DIR, READ_LABELS
 from app.db import Database
-from app.media_meta import book_stats_text, movie_stats_text
+from app.media_meta import book_stats_text_full, movie_stats_text
 from app.profile import effective_name
 from app.ui.read_stamp import ReadStamp
 from app.ui.segmented import SegmentedSwitch
@@ -333,7 +333,7 @@ class AddWishDialog(MessageBoxBase):
                 row['effective_date'] or row['marked_date'] or '未设置',
             ]
             if row['media_type'] == 'book':
-                meta_parts.append(book_stats_text(
+                meta_parts.append(book_stats_text_full(
                     row['subject_id'], int(row['word_count'] or 0)
                 ))
             elif row['media_type'] == 'movie':
@@ -450,7 +450,7 @@ class AddDoulistDialog(MessageBoxBase):
             checkbox = CheckBox(item['title'], item_widget)
             meta_parts = [_read_text(item['media_type'], item['is_read'])]
             if item['media_type'] == 'book':
-                meta_parts.append(book_stats_text(
+                meta_parts.append(book_stats_text_full(
                     item['subject_id'], self.word_counts.get(str(item['subject_id']), 0)
                 ))
             elif item['media_type'] == 'movie':
@@ -708,7 +708,7 @@ class PlanPage(QWidget):
             for position, item in enumerate(items, 1):
                 stats = ''
                 if item['media_type'] == 'book':
-                    stats = book_stats_text(
+                    stats = book_stats_text_full(
                         item['subject_id'], word_counts.get(str(item['subject_id']), 0)
                     )
                 elif item['media_type'] == 'movie':

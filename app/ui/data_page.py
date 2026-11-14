@@ -39,6 +39,7 @@ from app.config import APP_VERSION_TEXT, OUTPUT_DIR, ROOT
 from app.db import Database
 from app.douban import cover_file_ok, fetch_cover
 from app.excel import ExcelError, default_export_name, export_excel, import_excel
+from app.media_meta import book_pages, ensure_subject_meta
 from app.profile import (
     DEFAULT_NAME,
     avatar_source,
@@ -96,28 +97,65 @@ def _initial_pixmap(text: str, size: int = AVATAR_SIZE) -> QPixmap:
     return canvas
 
 
-class CoverBackfillWorker(QThread):
-    progress = Signal(int, int)
-    done = Signal(int)
+class BackfillWorker(QThread):
+    progress = Signal(str, int, int)
+    done = Signal(int, int, int)
 
-    def __init__(self, db: Database, rows: list, parent=None):
+    def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
-        self.rows = rows
 
-    def run(self) -> None:
+    def _cover_rows(self) -> list[tuple[str, object]]:
+        rows = [('record', row) for row in self.db.records_with_cover_url()]
+        rows.extend(('doulist', row) for row in self.db.doulist_items_with_cover_url())
+        rows.extend(('plan', row) for row in self.db.plan_items_with_cover_url())
+        todo = []
+        for kind, row in rows:
+            cover_path = row['cover_path'] or ''
+            if cover_path:
+                path = Path(cover_path)
+                if not path.is_absolute():
+                    path = ROOT / path
+                if cover_file_ok(path):
+                    continue
+            todo.append((kind, row))
+        return todo
+
+    def _backfill_covers(self) -> int:
+        todo = self._cover_rows()
         downloaded = 0
-        total = len(self.rows)
-        for index, row in enumerate(self.rows, 1):
+        for index, (kind, row) in enumerate(todo, 1):
+            self.progress.emit(f'正在补全封面 {index}/{len(todo)}…', index, len(todo))
             path = fetch_cover(
                 row['cover_url'], row['media_type'], row['subject_id'],
                 row['url'] or '',
             )
-            if path:
+            if not path:
+                continue
+            if kind == 'record':
                 self.db.set_record_cover(int(row['id']), path)
-                downloaded += 1
-            self.progress.emit(index, total)
-        self.done.emit(downloaded)
+            elif kind == 'doulist':
+                self.db.set_doulist_item_cover(int(row['id']), path)
+            else:
+                self.db.set_plan_item_cover(int(row['id']), path)
+            downloaded += 1
+        return downloaded
+
+    def _backfill_pages(self) -> tuple[int, int]:
+        missing = [subject for subject in self.db.book_subjects_for_meta()
+                   if book_pages(subject['subject_id']) is None]
+        if not missing:
+            return 0, 0
+        result = ensure_subject_meta(
+            'book', missing,
+            progress=lambda message, index, total: self.progress.emit(message, index, total),
+        )
+        return int(result.get('fetched', 0)), int(result.get('failed', 0))
+
+    def run(self) -> None:
+        covers = self._backfill_covers()
+        pages, failed = self._backfill_pages()
+        self.done.emit(covers, pages, failed)
 
 
 class DataPage(QWidget):
@@ -523,7 +561,8 @@ class DataPage(QWidget):
             'recycle_records', 'recycle_doulists', 'recycle_doulist_items',
             'recycle_plan_folders', 'recycle_plan_items',
         ))
-        message = (f"记录 {result['records']} 条，豆列 {result['doulists']} 个，"
+        message = (f"记录 {result['records']} 条，书籍字数 {result.get('book_words', 0)} 条，"
+                   f"豆列 {result['doulists']} 个，"
                    f"豆列条目 {result['doulist_items']} 条，计划 {result['plans']} 条，"
                    f"回收站 {recycle_total} 项，彻底删除 {result.get('purged_records', 0)} 条，"
                    f"忽略条目 {result['ignored_subjects']} 条。")
@@ -546,13 +585,14 @@ class DataPage(QWidget):
             return
         self.refresh()
         self.records_changed.emit()
-        self.backfill_covers()
+        self.backfill_metadata()
         errors = result.get('errors') or []
         recycle_total = sum(result.get(key, 0) for key in (
             'recycle_records', 'recycle_doulists', 'recycle_doulist_items',
             'recycle_plan_folders', 'recycle_plan_items',
         ))
         message = (f"记录新增 {result['records_inserted']}，更新 {result['records_updated']}；"
+                   f"书籍字数 {result.get('book_words', 0)} 条；"
                    f"计划文件夹 {result.get('plan_folders_added', 0)} 个，"
                    f"计划条目新增 {result['plans_added']}；豆列 {result['doulists']}，"
                    f"豆列条目 {result['doulist_items']}；回收站 {recycle_total} 项；"
@@ -563,33 +603,34 @@ class DataPage(QWidget):
         self.excel_status.setText('导入完成：' + message)
         InfoBar.success('导入完成', message, parent=self, position=InfoBarPosition.TOP, duration=8000)
 
-    def backfill_covers(self) -> None:
-        todo = []
-        for row in self.db.records_with_cover_url():
-            cover_path = row['cover_path'] or ''
-            if cover_path:
-                path = Path(cover_path)
-                if not path.is_absolute():
-                    path = ROOT / path
-                if cover_file_ok(path):
-                    continue
-            todo.append(row)
-        if not todo:
-            return
-        self._cover_worker = CoverBackfillWorker(self.db, todo, self)
-        self._cover_worker.progress.connect(
-            lambda index, total: self.excel_status.setText(f'导入完成，正在补全封面 {index}/{total}…')
-        )
-        self._cover_worker.done.connect(self._on_covers_done)
-        self._cover_worker.start()
+    def backfill_metadata(self) -> None:
+        self._backfill_worker = BackfillWorker(self.db, self)
+        self._backfill_worker.progress.connect(self._on_backfill_progress)
+        self._backfill_worker.done.connect(self._on_backfill_done)
+        self._backfill_worker.start()
 
-    def _on_covers_done(self, count: int) -> None:
+    def _on_backfill_progress(self, message: str, index: int, total: int) -> None:
+        if total:
+            self.excel_status.setText(f'{message}（{index}/{total}）')
+        else:
+            self.excel_status.setText(message)
+
+    def _on_backfill_done(self, covers: int, pages: int, failed: int = 0) -> None:
         self.excel_status.setText('导出文件默认保存在 output/exports。')
         self.refresh()
         self.records_changed.emit()
-        if count:
-            InfoBar.success('封面已补全', f'已下载 {count} 张封面。', parent=self,
+        parts = []
+        if covers:
+            parts.append(f'封面 {covers} 张')
+        if pages:
+            parts.append(f'页数 {pages} 条')
+        if parts:
+            InfoBar.success('信息已补全', '已从豆瓣补全' + '、'.join(parts) + '。', parent=self,
                             position=InfoBarPosition.TOP, duration=5000)
+        if failed:
+            InfoBar.warning('部分信息补全失败',
+                            f'{failed} 条信息未取到，可能触发了豆瓣风控，可稍后重新导入。',
+                            parent=self, position=InfoBarPosition.TOP, duration=6000)
 
     def open_data_dir(self) -> None:
         ROOT.mkdir(parents=True, exist_ok=True)

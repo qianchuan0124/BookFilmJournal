@@ -23,9 +23,7 @@ fi
 
 codesign --force --deep --sign - "$APP" || true
 rm -rf dist/ShuyingJilu
-ARCH="$(uname -m)"
-STAMP="$(date +%Y%m%d)"
-NAME="ShuyingJilu-macOS-${ARCH}-${STAMP}"
+NAME="ShuyingJilu-mac"
 ditto -c -k --norsrc --keepParent "$APP" "dist/${NAME}.zip"
 
 # hdiutil create --srcfolder 需要挂载临时卷，在残留映像、卷名冲突或文件系统抖动时

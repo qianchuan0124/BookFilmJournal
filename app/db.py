@@ -575,6 +575,55 @@ class Database:
                 (cover_path, _now(), record_id),
             )
 
+    def doulist_items_with_cover_url(self) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute('''
+                SELECT i.id, i.media_type, i.subject_id, i.title, i.url,
+                       i.cover_url, i.cover_path
+                FROM doulist_items i
+                JOIN doulists d ON d.id=i.doulist_id AND d.deleted_at=''
+                WHERE i.cover_url<>''
+            ''').fetchall()
+
+    def plan_items_with_cover_url(self) -> list[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute('''
+                SELECT id, media_type, subject_id, title, url, cover_url, cover_path
+                FROM plan_items
+                WHERE deleted_at='' AND cover_url<>''
+            ''').fetchall()
+
+    def set_doulist_item_cover(self, item_id: int, cover_path: str) -> None:
+        with self._connect() as conn:
+            conn.execute('UPDATE doulist_items SET cover_path=? WHERE id=?',
+                         (cover_path, int(item_id)))
+
+    def set_plan_item_cover(self, item_id: int, cover_path: str) -> None:
+        with self._connect() as conn:
+            conn.execute('UPDATE plan_items SET cover_path=? WHERE id=?',
+                         (cover_path, int(item_id)))
+
+    def book_subjects_for_meta(self) -> list[dict]:
+        """记录、豆列、计划中出现过的全部书籍（去重），用于补全页数等信息。"""
+        with self._connect() as conn:
+            rows = conn.execute('''
+                SELECT subject_id, MAX(title) AS title FROM (
+                    SELECT subject_id, title FROM records
+                    WHERE media_type='book' AND deleted_at=''
+                    UNION ALL
+                    SELECT i.subject_id, i.title FROM doulist_items i
+                    JOIN doulists d ON d.id=i.doulist_id AND d.deleted_at=''
+                    WHERE i.media_type='book'
+                    UNION ALL
+                    SELECT subject_id, title FROM plan_items
+                    WHERE media_type='book' AND deleted_at=''
+                )
+                GROUP BY subject_id
+                ORDER BY title
+            ''').fetchall()
+        return [{'subject_id': str(row['subject_id']), 'title': row['title'] or ''}
+                for row in rows]
+
     def set_word_count(self, record_id: int, word_count: int, book_file: str = '') -> None:
         with self._connect() as conn:
             conn.execute('''
@@ -1026,6 +1075,26 @@ class Database:
                     book_file=excluded.book_file,
                     updated_at=excluded.updated_at
             ''', (str(subject_id), int(word_count or 0), book_file, _now()))
+
+    def book_word_entries(self) -> list[dict]:
+        """所有书籍的字数（记录表 + 豆列/计划统计结果），按 subject_id 合并。"""
+        with self._connect() as conn:
+            rows = conn.execute('''
+                SELECT subject_id, MAX(word_count) AS word_count,
+                       MAX(book_file) AS book_file
+                FROM (
+                    SELECT subject_id, word_count, book_file FROM records
+                    WHERE media_type='book' AND deleted_at='' AND word_count>0
+                    UNION ALL
+                    SELECT subject_id, word_count, book_file FROM book_words
+                    WHERE word_count>0
+                )
+                GROUP BY subject_id
+                ORDER BY subject_id
+            ''').fetchall()
+        return [{'subject_id': str(row['subject_id']),
+                 'word_count': int(row['word_count'] or 0),
+                 'book_file': row['book_file'] or ''} for row in rows]
 
     def set_word_count_for_subject(self, subject_id: str, word_count: int,
                                    book_file: str = '') -> None:

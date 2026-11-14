@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import random
 import re
 import time
 from functools import lru_cache
@@ -239,7 +240,7 @@ def _meta_is_complete(media_type: str, entry: Optional[dict]) -> bool:
 
 def ensure_subject_meta(media_type: str, subjects,
                         progress: Optional[Callable[[str, int, int], None]] = None,
-                        delay: float = 1.0) -> dict:
+                        delay: float = 0.4) -> dict:
     import requests
 
     if media_type not in ('book', 'movie'):
@@ -265,6 +266,11 @@ def ensure_subject_meta(media_type: str, subjects,
     fetched = 0
     failed = 0
     failure_streak = 0
+    # 基准间隔很短，命中风控后自动放慢；每抓一批再停顿一次，兼顾速度与安全。
+    base_delay = max(0.05, float(delay))
+    current_delay = base_delay
+    batch_size = 25
+    batch_pause = 3.0
     for index, (subject_id, subject) in enumerate(missing, 1):
         title = subject.get('title') or subject_id
         if progress:
@@ -277,18 +283,21 @@ def ensure_subject_meta(media_type: str, subjects,
                 response = session.get(
                     url,
                     headers={'Referer': f'https://{host}.douban.com/subject/{subject_id}/'},
-                    timeout=20,
+                    timeout=15,
                 )
-                if response.status_code in (403, 418, 429) and attempt == 0:
-                    time.sleep(5)
-                    continue
+                if response.status_code in (403, 418, 429):
+                    if attempt == 0:
+                        current_delay = min(2.0, max(0.5, current_delay * 1.8))
+                        time.sleep(5)
+                        continue
+                    break
                 if response.status_code != 200:
                     raise RuntimeError(f'HTTP {response.status_code}')
                 data = response.json()
                 break
             except Exception:
                 if attempt == 0:
-                    time.sleep(2)
+                    time.sleep(1.5)
         if media_type == 'movie' and (data is None or not data.get('durations')):
             mobile = _fetch_movie_mobile(session, subject_id)
             if mobile:
@@ -301,6 +310,7 @@ def ensure_subject_meta(media_type: str, subjects,
             continue
         failure_streak = 0
         fetched += 1
+        current_delay = max(base_delay, current_delay * 0.95)
         previous = cache.get(subject_id) or {}
         if media_type == 'book':
             entry = {
@@ -326,9 +336,9 @@ def ensure_subject_meta(media_type: str, subjects,
             cache[subject_id] = entry
         if fetched % 10 == 0:
             _write_json(cache_path, cache)
-        if fetched % 20 == 0:
-            time.sleep(5)
-        time.sleep(delay)
+        if fetched % batch_size == 0:
+            time.sleep(batch_pause)
+        time.sleep(current_delay + random.uniform(0, 0.2))
     _write_json(cache_path, cache)
     if media_type == 'book':
         load_book_meta.cache_clear()
@@ -346,3 +356,18 @@ def format_book_stats(pages: Optional[int], word_count: int = 0) -> str:
 
 def book_stats_text(subject_id, word_count: int = 0) -> str:
     return format_book_stats(book_pages(subject_id), word_count)
+
+
+def format_book_stats_full(pages: Optional[int], word_count: int = 0) -> str:
+    """计划等场景同时展示页数与字数，两者都缺省时才显示未知。"""
+    parts = []
+    if pages:
+        parts.append(f'{pages:,} 页')
+    words = format_word_count(int(word_count or 0))
+    if words:
+        parts.append(words)
+    return ' · '.join(parts) if parts else '页数/字数未知'
+
+
+def book_stats_text_full(subject_id, word_count: int = 0) -> str:
+    return format_book_stats_full(book_pages(subject_id), word_count)

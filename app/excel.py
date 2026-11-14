@@ -19,6 +19,7 @@ DOULIST_ITEM_HEADERS = [
     '评分', '短评', '简介', '位置', '创建时间',
 ]
 PLAN_FOLDER_HEADERS = ['类型', '计划名称', '备注', '顺序']
+BOOK_WORD_HEADERS = ['豆瓣ID', '字数', '电子书文件']
 PLAN_HEADERS = ['计划名称', '顺序', '类型', '条目ID', '标题', '链接', '封面URL',
                 '封面路径', '来源', '来源ID', '备注']
 RECYCLE_RECORD_HEADERS = RECORD_HEADERS + ['删除时间', '删除来源']
@@ -107,6 +108,12 @@ def export_excel(db: Database, path: str) -> dict:
         ws = workbook.create_sheet(_sheet_title(media_type, '记录'))
         rows = [_record_row(row) for row in records if row['media_type'] == media_type]
         _write_sheet(ws, RECORD_HEADERS, rows)
+
+    ws = workbook.create_sheet('书籍字数')
+    book_words = db.book_word_entries()
+    _write_sheet(ws, BOOK_WORD_HEADERS, [[
+        row['subject_id'], row['word_count'], row['book_file'],
+    ] for row in book_words])
 
     ws = workbook.create_sheet('豆列')
     doulists = db.list_doulists()
@@ -203,6 +210,7 @@ def export_excel(db: Database, path: str) -> dict:
     return {
         'path': str(output_path),
         'records': len(records),
+        'book_words': len(book_words),
         'doulists': len(doulists),
         'doulist_items': len(item_rows),
         'plan_folders': len(folder_rows),
@@ -341,6 +349,7 @@ def import_excel(db: Database, path: str) -> dict:
     stats = {
         'records_inserted': 0,
         'records_updated': 0,
+        'book_words': 0,
         'plans_added': 0,
         'plan_folders_added': 0,
         'doulists': 0,
@@ -381,6 +390,15 @@ def import_excel(db: Database, path: str) -> dict:
                 result = db.import_records(record_rows)
                 stats['records_inserted'] += result['inserted']
                 stats['records_updated'] += result['updated']
+
+        if '书籍字数' in workbook.sheetnames:
+            for row in _rows_as_dicts(workbook['书籍字数']):
+                subject_id = _text(row.get('豆瓣ID'))
+                word_count = _int(row.get('字数'))
+                if not subject_id or word_count <= 0:
+                    continue
+                db.set_book_word(subject_id, word_count, _text(row.get('电子书文件')))
+                stats['book_words'] += 1
 
         if '豆列' in workbook.sheetnames:
             for row in _rows_as_dicts(workbook['豆列']):

@@ -33,7 +33,7 @@ class RecordsPage(QWidget):
     record_changed = Signal(str)
 
     # 首屏同步创建少量卡片，其余在事件循环空闲时分批补齐。
-    _INITIAL_CARDS = 24
+    _INITIAL_CARDS = 12
     _WARMUP_CARDS = 8
     _BATCH_CARDS = 8
 
@@ -178,36 +178,13 @@ class RecordsPage(QWidget):
         groups = []
         lines = []
         pending = []
+        total_rows = 0
+        # 日期分组头改为按需创建：记录多时一次性创建上千个控件会卡住切换，导致旧页面残留。
         for date_str, rows in self.db.grouped_records(self.media_type, status):
-            header = QWidget(widget)
-            header_layout = QHBoxLayout(header)
-            header_layout.setContentsMargins(0, 0, 0, 0)
-            header_layout.setSpacing(10)
-            date_label = StrongBodyLabel(_date_heading(date_str), header)
-            header_layout.addWidget(date_label)
-            count = CaptionLabel(f'{len(rows)} {MEDIA_NOUNS[self.media_type]}', header)
-            count.setTextColor('#5f6b7a', '#8d95a5')
-            header_layout.addWidget(count)
-            header_layout.addStretch(1)
-            line = QFrame(header)
-            line.setFixedHeight(1)
-            line.setStyleSheet(f'background: {self._divider_color()};')
-            lines.append(line)
-            header_layout.addWidget(line, 1)
-            box.addWidget(header)
-
-            group_widget = QWidget(widget)
-            group_widget.setStyleSheet('background:transparent;')
-            group_widget.setProperty('totalRows', len(rows))
-            flow = FlowLayout(group_widget, needAni=False, isTight=True)
-            flow.setContentsMargins(0, 0, 0, 0)
-            flow.setHorizontalSpacing(14)
-            flow.setVerticalSpacing(14)
-            group_cards = []
-            box.addWidget(group_widget)
-            groups.append((header, count, group_widget, group_cards, date_str))
+            total_rows += len(rows)
             pending.append({
-                'flow': flow, 'rows': list(rows), 'cards': group_cards, 'group': group_widget,
+                'rows': list(rows), 'total': len(rows), 'cards': [], 'group': None,
+                'header': None, 'flow': None, 'date': date_str,
             })
 
         empty_label = BodyLabel('', widget)
@@ -218,11 +195,49 @@ class RecordsPage(QWidget):
         self.content_layout.addWidget(widget)
         view = {
             'widget': widget, 'cards': cards, 'groups': groups, 'empty': empty_label,
-            'lines': lines, 'pending': pending,
+            'lines': lines, 'pending': pending, 'box': box, 'totalRows': total_rows,
         }
         budget = self._INITIAL_CARDS if initial_cards is None else initial_cards
         self._add_cards(view, budget)
         return view
+
+    def _create_group(self, view: dict, entry: dict) -> None:
+        """创建某个日期分组的标题和容器，按需调用。"""
+        widget = view['widget']
+        box = view['box']
+        media_noun = MEDIA_NOUNS[self.media_type]
+        header = QWidget(widget)
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(10)
+        date_label = StrongBodyLabel(_date_heading(entry['date']), header)
+        header_layout.addWidget(date_label)
+        count = CaptionLabel(f'{entry["total"]} {media_noun}', header)
+        count.setTextColor('#5f6b7a', '#8d95a5')
+        header_layout.addWidget(count)
+        header_layout.addStretch(1)
+        line = QFrame(header)
+        line.setFixedHeight(1)
+        line.setStyleSheet(f'background: {self._divider_color()};')
+        header_layout.addWidget(line, 1)
+        # 先隐藏分组头，等第一张卡片建好再一起显示，避免出现只有日期和条数的空分组。
+        header.setVisible(False)
+
+        group_widget = QWidget(widget)
+        group_widget.setStyleSheet('background:transparent;')
+        group_widget.setProperty('totalRows', entry['total'])
+        group_widget.setVisible(False)
+        flow = FlowLayout(group_widget, needAni=False, isTight=True)
+        flow.setContentsMargins(0, 0, 0, 0)
+        flow.setHorizontalSpacing(14)
+        flow.setVerticalSpacing(14)
+
+        # 插到空状态提示与末尾弹簧之前，保持日期先后顺序。
+        box.insertWidget(box.count() - 2, header)
+        box.insertWidget(box.count() - 2, group_widget)
+        entry.update(header=header, group=group_widget, flow=flow)
+        view['groups'].append((header, count, group_widget, entry['cards'], entry['date']))
+        view['lines'].append(line)
 
     def _add_cards(self, view: dict, budget: int) -> int:
         """按预算补充卡片，返回仍未创建的条目数。"""
@@ -231,11 +246,17 @@ class RecordsPage(QWidget):
         built = 0
         while pending and built < budget:
             entry = pending[0]
+            if entry['group'] is None:
+                self._create_group(view, entry)
             row = entry['rows'].pop(0)
             card = self._make_card(row, entry['group'])
             entry['flow'].addWidget(card)
             entry['cards'].append((card, row))
             view['cards'].append(card)
+            if len(entry['cards']) == 1 and not keyword:
+                # 该日期分组有了第一张卡片，才把日期头和内容区一起显示。
+                self._set_visible(entry['header'], True)
+                self._set_visible(entry['group'], True)
             if keyword:
                 matched = keyword in f"{row['title']} {row['comment']}".lower()
                 self._set_visible(card, matched)
@@ -331,10 +352,9 @@ class RecordsPage(QWidget):
         self._schedule_warmup()
 
     def mark_dirty(self) -> None:
-        if self.isVisible():
-            self.refresh()
-        else:
-            self._dirty = True
+        # 即使在后台也立即重建首屏，避免切换到该页时才做耗时构建导致先显示旧内容。
+        self._dirty = False
+        self.refresh()
 
     def refresh(self) -> None:
         bar = self.scroll.verticalScrollBar()
@@ -382,6 +402,10 @@ class RecordsPage(QWidget):
             self._saved_scroll = self.scroll.verticalScrollBar().value()
             self._saved_height = self.container.height()
         total = 0
+        view = self.current_view
+        if not keyword and view is not None:
+            # 未创建的日期分组不在 self._groups 中，总数直接取视图的完整记录数。
+            total = int(view.get('totalRows') or 0)
         for header, count_label, group_widget, cards, _ in self._groups:
             if keyword:
                 visible = 0
@@ -401,9 +425,12 @@ class RecordsPage(QWidget):
                     if card.highlight:
                         card.set_highlight('')
             count_label.setText(f'{visible} {MEDIA_NOUNS[self.media_type]}')
-            self._set_visible(header, visible > 0)
-            self._set_visible(group_widget, visible > 0)
-            total += visible
+            # 卡片尚未建好的分组先不显示，避免只剩日期和条数的空分组。
+            show = visible > 0 and bool(cards)
+            self._set_visible(header, show)
+            self._set_visible(group_widget, show)
+            if keyword:
+                total += visible
         if not clearing:
             self._reflow()
         self._had_search = bool(keyword)

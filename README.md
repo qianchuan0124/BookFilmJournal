@@ -85,9 +85,9 @@
 
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
-| macOS | `ShuyingJilu-macOS-arm64-<日期>.dmg` | 拖入「应用程序」即可 |
-| macOS | `ShuyingJilu-macOS-arm64-<日期>.zip` | 解压后双击「书影记录.app」 |
-| Windows | `ShuyingJilu-windows-x64.zip` | 解压后运行 `ShuyingJilu.exe` |
+| macOS | `ShuyingJilu-mac.dmg` | 拖入「应用程序」即可 |
+| macOS | `ShuyingJilu-mac.zip` | 解压后双击「书影记录.app」 |
+| Windows | `ShuyingJilu-win.zip` | 解压后运行 `ShuyingJilu.exe` |
 
 macOS 包为 ad-hoc 签名，未做 Apple 公证；首次打开如被 Gatekeeper 拦截，右键选择「打开」。Windows 包未做代码签名，SmartScreen 可能会提示。
 
@@ -97,7 +97,7 @@ macOS 包为 ad-hoc 签名，未做 Apple 公证；首次打开如被 Gatekeeper
 git clone <本仓库地址>
 cd BookFilmJournal
 
-python3 -m venv .venv
+python3 -m venv .venv            # Windows: python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 
@@ -121,7 +121,7 @@ packaging\build_windows.bat --portable-only
 
 - macOS App 约 565 MB，ZIP 约 204 MB，DMG 约 240–255 MB；体积主要来自 `QtWebEngineCore`（约 290 MB）及 Chromium 运行资源，用于内置扫码登录。
 - PyInstaller 不支持从 macOS 交叉编译 Windows 包，需要在 Windows 10/11 上执行。
-- Windows 产物：便携目录 `dist\ShuyingJilu\`、便携 zip `dist\ShuyingJilu-windows-x64.zip`、安装包 `dist\ShuyingJilu-windows-x64-setup.exe`。
+- Windows 产物：便携目录 `dist\ShuyingJilu\`、便携 zip `dist\ShuyingJilu-win.zip`、安装包 `dist\ShuyingJilu-win.setup.exe`。
 - 安装包由 Inno Setup 6 编译（脚本 `packaging\ShuyingJilu.iss`），需先安装 Inno Setup 6 并确保 `ISCC.exe` 可用；安装到当前用户目录，无需管理员权限，安装时可选桌面快捷方式。
 
 ```bash
