@@ -106,6 +106,32 @@ def _initial_pixmap(text: str, size: int = AVATAR_SIZE) -> QPixmap:
     return canvas
 
 
+def _missing_cover_rows(db: Database) -> list[tuple[str, object]]:
+    """返回封面文件缺失、需要重新下载的记录 / 豆列条目 / 计划条目。"""
+    rows = [('record', row) for row in db.records_with_cover_url()]
+    rows.extend(('doulist', row) for row in db.doulist_items_with_cover_url())
+    rows.extend(('plan', row) for row in db.plan_items_with_cover_url())
+    todo = []
+    for kind, row in rows:
+        cover_path = row['cover_path'] or ''
+        if cover_path:
+            path = Path(cover_path)
+            if not path.is_absolute():
+                path = ROOT / path
+            if cover_file_ok(path):
+                continue
+        todo.append((kind, row))
+    return todo
+
+
+def missing_metadata_counts(db: Database) -> tuple[int, int]:
+    """统计缺失的封面张数与书籍页数，用于恢复后提示是否补全。"""
+    covers = len(_missing_cover_rows(db))
+    pages = sum(1 for subject in db.book_subjects_for_meta()
+                if book_pages(subject['subject_id']) is None)
+    return covers, pages
+
+
 class BackfillWorker(QThread):
     progress = Signal(str, int, int)
     done = Signal(int, int, int)
@@ -115,20 +141,7 @@ class BackfillWorker(QThread):
         self.db = db
 
     def _cover_rows(self) -> list[tuple[str, object]]:
-        rows = [('record', row) for row in self.db.records_with_cover_url()]
-        rows.extend(('doulist', row) for row in self.db.doulist_items_with_cover_url())
-        rows.extend(('plan', row) for row in self.db.plan_items_with_cover_url())
-        todo = []
-        for kind, row in rows:
-            cover_path = row['cover_path'] or ''
-            if cover_path:
-                path = Path(cover_path)
-                if not path.is_absolute():
-                    path = ROOT / path
-                if cover_file_ok(path):
-                    continue
-            todo.append((kind, row))
-        return todo
+        return _missing_cover_rows(self.db)
 
     def _backfill_covers(self) -> int:
         todo = self._cover_rows()
@@ -257,7 +270,7 @@ class DataPage(QWidget):
             '应用内不支持登录 iCloud：请先在系统设置登录并开启 iCloud 云盘，'
             'Windows 需安装 iCloud for Windows。备份与恢复都需要手动点击按钮触发，'
             '应用不会自动上传或覆盖数据。快照不包含登录 Cookie；'
-            '封面不随快照同步，换设备后可重新同步豆瓣补全。',
+            '封面与页数不随快照同步，恢复后会提示从豆瓣补全。',
             sync_card,)
         sync_hint.setWordWrap(True)
         sync_hint.setTextColor('#5f6b7a', '#8d95a5')
@@ -647,20 +660,24 @@ class DataPage(QWidget):
         self.excel_status.setText('导入完成：' + message)
         InfoBar.success('导入完成', message, parent=self, position=InfoBarPosition.TOP, duration=8000)
 
-    def backfill_metadata(self) -> None:
+    def backfill_metadata(self, reason: str = 'import') -> None:
+        self._backfill_reason = reason
         self._backfill_worker = BackfillWorker(self.db, self)
         self._backfill_worker.progress.connect(self._on_backfill_progress)
         self._backfill_worker.done.connect(self._on_backfill_done)
         self._backfill_worker.start()
 
     def _on_backfill_progress(self, message: str, index: int, total: int) -> None:
-        if total:
-            self.excel_status.setText(f'{message}（{index}/{total}）')
+        text = f'{message}（{index}/{total}）' if total else message
+        if getattr(self, '_backfill_reason', 'import') == 'restore':
+            self.sync_status.setText(text)
         else:
-            self.excel_status.setText(message)
+            self.excel_status.setText(text)
 
     def _on_backfill_done(self, covers: int, pages: int, failed: int = 0) -> None:
-        self.excel_status.setText('导出文件默认保存在 output/exports。')
+        restore = getattr(self, '_backfill_reason', 'import') == 'restore'
+        if not restore:
+            self.excel_status.setText('导出文件默认保存在 output/exports。')
         self.refresh()
         self.records_changed.emit()
         parts = []
@@ -672,8 +689,11 @@ class DataPage(QWidget):
             InfoBar.success('信息已补全', '已从豆瓣补全' + '、'.join(parts) + '。', parent=self,
                             position=InfoBarPosition.TOP, duration=5000)
         if failed:
+            hint = '可稍后重试。'
+            if not (self.db.get_setting('douban_cookie') or '').strip():
+                hint = '可登录豆瓣并同步一次，或稍后重试。'
             InfoBar.warning('部分信息补全失败',
-                            f'{failed} 条信息未取到，可能触发了豆瓣风控，可稍后重新导入。',
+                            f'{failed} 条信息未取到，可能触发了豆瓣风控，{hint}',
                             parent=self, position=InfoBarPosition.TOP, duration=6000)
 
     def refresh_sync(self) -> None:
@@ -814,6 +834,25 @@ class DataPage(QWidget):
             f"已恢复 {restored.get('records', 0)} 条记录；旧数据库备份在 {result['local_backup']}",
             parent=self, position=InfoBarPosition.TOP, duration=8000,
         )
+        covers, pages = missing_metadata_counts(self.db)
+        if not covers and not pages:
+            return
+        missing = []
+        if covers:
+            missing.append(f'{covers} 张封面')
+        if pages:
+            missing.append(f'{pages} 本书的页数')
+        box = MessageBox(
+            '补全封面与页数',
+            '快照不包含封面图片和书籍页数，检测到缺少' + '、'.join(missing) + '。\n\n'
+            '现在从豆瓣公开页面补全吗？补全无需登录；'
+            '如果条目无法访问或触发风控，可登录豆瓣后重试。',
+            self.window(),
+        )
+        box.yesButton.setText('开始补全')
+        box.cancelButton.setText('稍后')
+        if box.exec():
+            self.backfill_metadata(reason='restore')
 
     def open_data_dir(self) -> None:
         ROOT.mkdir(parents=True, exist_ok=True)

@@ -168,7 +168,7 @@ Chrome/Edge 仅作为 PNG 内置渲染失败时的回退，不会打进安装包
 - `ignored_subjects`：更换来源时记录的旧豆瓣 ID，同步时跳过，避免重复条目；
 - `book_words`：豆列中尚未建立记录的书籍字数，与记录中的字数一起参与展示与统计。
 
-云同步快照位于同步目录下的 `书影记录/`：`douban_trace_YYYYmmdd_HHMMSS.db` 为一致性数据库快照，`latest.json` 记录最新快照的时间、设备、条数与校验值；默认保留最近 8 份。恢复前会把当前数据库自动备份到 `data/backups/`。快照不包含登录 Cookie、书库路径等本机设置，恢复时保留本机值。
+云同步快照位于同步目录下的 `书影记录/`：`douban_trace_YYYYmmdd_HHMMSS.db` 为一致性数据库快照，`latest.json` 记录最新快照的时间、设备、条数与校验值；默认保留最近 8 份。恢复前会把当前数据库自动备份到 `data/backups/`。快照不包含登录 Cookie、书库路径等本机设置，恢复时保留本机值；封面图片与书籍页数保存在本地 `cache/`，恢复后应用会检测缺失并询问是否从豆瓣补全。
 
 同步策略：新记录写入时 `effective_date = marked_date`；全量同步只在 `date_overridden = 0` 时更新 `effective_date`，并在 `rating_overridden` / `comment_overridden` 为 0 时更新评分与短评；增量同步不更新已有记录。`status` 参与唯一键，因此同一部作品可以同时有看过和想看记录。
 
