@@ -35,7 +35,16 @@ from qfluentwidgets import (
     setTheme,
 )
 
-from app.config import APP_VERSION_TEXT, OUTPUT_DIR, ROOT
+from app.cloud_sync import (
+    SYNC_SUBDIR,
+    SyncError,
+    base_dir,
+    check_sync,
+    create_snapshot,
+    detected_dirs,
+    restore_snapshot,
+)
+from app.config import APP_VERSION, APP_VERSION_TEXT, OUTPUT_DIR, ROOT
 from app.db import Database
 from app.douban import cover_file_ok, fetch_cover
 from app.excel import ExcelError, default_export_name, export_excel, import_excel
@@ -237,6 +246,40 @@ class DataPage(QWidget):
         self.excel_status.setTextColor('#5f6b7a', '#8d95a5')
         excel_layout.addWidget(self.excel_status)
         layout.addWidget(excel_card)
+
+        sync_card = CardWidget(self)
+        sync_card.setBorderRadius(14)
+        sync_layout = QVBoxLayout(sync_card)
+        sync_layout.setContentsMargins(22, 20, 22, 20)
+        sync_layout.setSpacing(10)
+        sync_layout.addWidget(BodyLabel('云同步（iCloud / OneDrive）', sync_card))
+        sync_hint = CaptionLabel(
+            '应用内不支持登录 iCloud：请先在系统设置登录并开启 iCloud 云盘，'
+            'Windows 需安装 iCloud for Windows。备份与恢复都需要手动点击按钮触发，'
+            '应用不会自动上传或覆盖数据。快照不包含登录 Cookie；'
+            '封面不随快照同步，换设备后可重新同步豆瓣补全。',
+            sync_card,)
+        sync_hint.setWordWrap(True)
+        sync_hint.setTextColor('#5f6b7a', '#8d95a5')
+        sync_layout.addWidget(sync_hint)
+        self.sync_status = CaptionLabel('', sync_card)
+        self.sync_status.setWordWrap(True)
+        self.sync_status.setTextColor('#5f6b7a', '#8d95a5')
+        sync_layout.addWidget(self.sync_status)
+        sync_row = QHBoxLayout()
+        sync_row.setSpacing(10)
+        self.sync_dir_button = PushButton(FluentIcon.FOLDER, '选择同步目录', sync_card)
+        self.sync_dir_button.clicked.connect(self.choose_sync_dir)
+        sync_row.addWidget(self.sync_dir_button)
+        self.sync_backup_button = primary_button(FluentIcon.CLOUD, '立即备份', sync_card)
+        self.sync_backup_button.clicked.connect(self.backup_to_sync)
+        sync_row.addWidget(self.sync_backup_button)
+        self.sync_restore_button = PushButton(FluentIcon.CLOUD_DOWNLOAD, '检查并恢复', sync_card)
+        self.sync_restore_button.clicked.connect(self.restore_from_sync)
+        sync_row.addWidget(self.sync_restore_button)
+        sync_row.addStretch(1)
+        sync_layout.addLayout(sync_row)
+        layout.addWidget(sync_card)
 
         word_card = CardWidget(self)
         word_card.setBorderRadius(14)
@@ -523,6 +566,7 @@ class DataPage(QWidget):
     def refresh(self) -> None:
         self.refresh_account()
         self.refresh_calibre()
+        self.refresh_sync()
         books = self.db.list_all_records('book')
         counts = self.db.word_count_map('book')
         subject_ids = {str(row['subject_id']) for row in books} | set(counts)
@@ -631,6 +675,145 @@ class DataPage(QWidget):
             InfoBar.warning('部分信息补全失败',
                             f'{failed} 条信息未取到，可能触发了豆瓣风控，可稍后重新导入。',
                             parent=self, position=InfoBarPosition.TOP, duration=6000)
+
+    def refresh_sync(self) -> None:
+        try:
+            info = check_sync(self.db)
+        except Exception as exc:
+            self.sync_status.setText(f'同步状态读取失败：{exc}')
+            return
+        lines = []
+        root = base_dir(self.db)
+        if root is None:
+            lines.append('未检测到 iCloud 云盘或 OneDrive，请选择同步目录。')
+        elif not root.is_dir():
+            lines.append(f'同步目录不可用：{root}，请重新选择。')
+        else:
+            folder = root / SYNC_SUBDIR
+            suffix = '' if folder.is_dir() else '（尚未创建）'
+            candidates = detected_dirs()
+            source = ''
+            if not (self.db.get_setting('cloud_sync_dir') or '').strip() and candidates:
+                source = f'（自动识别为{candidates[0][0]}）'
+            lines.append(f'同步目录：{folder}{suffix}{source}')
+        manifest = info.get('manifest')
+        if manifest:
+            if info.get('missing'):
+                lines.append(f'最新快照 {manifest.get("snapshot")} 尚未下载完成。')
+            else:
+                counts = manifest.get('counts') or {}
+                lines.append(
+                    f'最近备份：{manifest.get("created_at", "未知时间")}'
+                    f' · {manifest.get("device", "未知设备")}'
+                    f' · 记录 {counts.get("records", 0)} 条'
+                    f' · 计划 {counts.get("plan_items", 0)} 条'
+                )
+        elif info['folder'] and Path(info['folder']).is_dir():
+            lines.append('同步目录里还没有备份，点击「立即备份」创建第一份。')
+        if manifest and info.get('dirty'):
+            lines.append('本地有尚未备份的改动。')
+        self.sync_status.setText('\n'.join(lines))
+
+    def choose_sync_dir(self) -> None:
+        start = base_dir(self.db) or Path.home()
+        folder = QFileDialog.getExistingDirectory(
+            self, '选择同步根目录（会自动创建「书影记录」子目录）', str(start)
+        )
+        if not folder:
+            return
+        try:
+            Path(folder).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            InfoBar.error('无法使用该目录', str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=6000)
+            return
+        selected = Path(folder)
+        root = selected.parent if selected.name == SYNC_SUBDIR else selected
+        self.db.set_setting('cloud_sync_dir', str(root))
+        self.refresh_sync()
+        InfoBar.success(
+            '同步目录已设置', f'{root / SYNC_SUBDIR}',
+            parent=self, position=InfoBarPosition.TOP, duration=5000,
+        )
+
+    def backup_to_sync(self) -> None:
+        try:
+            result = create_snapshot(self.db, force=True)
+        except SyncError as exc:
+            InfoBar.error('备份失败', str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=6000)
+            return
+        except Exception as exc:
+            InfoBar.error('备份失败', str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=6000)
+            return
+        counts = result.get('counts') or {}
+        InfoBar.success(
+            '已备份到同步目录',
+            f"快照 {result['snapshot']} · 记录 {counts.get('records', 0)} 条"
+            f" · 计划 {counts.get('plan_items', 0)} 条",
+            parent=self, position=InfoBarPosition.TOP, duration=6000,
+        )
+        self.refresh_sync()
+
+    def restore_from_sync(self) -> None:
+        try:
+            info = check_sync(self.db)
+        except Exception as exc:
+            InfoBar.error('读取同步目录失败', str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=6000)
+            return
+        manifest = info.get('manifest')
+        if not info['folder'] or not manifest:
+            InfoBar.warning(
+                '没有可恢复的备份',
+                '请确认已设置同步目录，并先在另一台设备上执行「立即备份」。',
+                parent=self, position=InfoBarPosition.TOP, duration=7000,
+            )
+            return
+        if info.get('missing'):
+            InfoBar.warning(
+                '备份尚未就绪', '快照文件还没有完整下载到本机，请稍后再试。',
+                parent=self, position=InfoBarPosition.TOP, duration=7000,
+            )
+            return
+        counts = manifest.get('counts') or {}
+        details = (
+            f"快照时间：{manifest.get('created_at', '未知')}\n"
+            f"来源设备：{manifest.get('device', '未知')}\n"
+            f"记录 {counts.get('records', 0)} 条 · 豆列 {counts.get('doulists', 0)} 个"
+            f" · 计划 {counts.get('plan_items', 0)} 条\n\n"
+            '恢复会覆盖本地数据库；恢复前会把当前数据库自动备份到 data/backups。'
+        )
+        if info.get('dirty'):
+            details += '\n\n注意：本地有尚未备份的改动，恢复后这些改动将丢失。'
+        app_version = manifest.get('app_version')
+        if app_version and app_version != APP_VERSION:
+            details += (f'\n\n备份来自 v{app_version}（当前 {APP_VERSION_TEXT}），'
+                        '版本不同可能无法完全兼容。')
+        box = MessageBox('从同步目录恢复', details, self.window())
+        box.yesButton.setText('恢复')
+        box.cancelButton.setText('取消')
+        if not box.exec():
+            return
+        try:
+            result = restore_snapshot(self.db, manifest)
+        except SyncError as exc:
+            InfoBar.error('恢复失败', str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=6000)
+            return
+        except Exception as exc:
+            InfoBar.error('恢复失败', str(exc), parent=self,
+                          position=InfoBarPosition.TOP, duration=6000)
+            return
+        self.refresh()
+        self.records_changed.emit()
+        restored = result.get('counts') or {}
+        InfoBar.success(
+            '恢复完成',
+            f"已恢复 {restored.get('records', 0)} 条记录；旧数据库备份在 {result['local_backup']}",
+            parent=self, position=InfoBarPosition.TOP, duration=8000,
+        )
 
     def open_data_dir(self) -> None:
         ROOT.mkdir(parents=True, exist_ok=True)

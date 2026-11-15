@@ -1,5 +1,6 @@
 import json
 import os
+import posixpath
 import re
 import shutil
 import sqlite3
@@ -11,6 +12,7 @@ from collections import defaultdict
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import unquote
 
 from app.config import BOOK_WORDS_CACHE
 
@@ -24,6 +26,9 @@ FORMAT_PRIORITY = {
     '.djvu': 10, '.chm': 11, '.html': 12, '.htm': 13,
 }
 CJK_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+# 提取逻辑变更后递增，用于让旧的缓存和已写入的字数重新统计一次。
+WORDS_VERSION = '2'
+HTML_MEDIA_TYPES = ('application/xhtml+xml', 'text/html')
 LATIN_WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
 NUMBER_RE = re.compile(r'\d+(?:[.,]\d+)*')
 BRACKET_RE = re.compile(r'\[[^\]]*\]|【[^】]*】|\([^)]*\)|（[^）]*）|\{([^{}]*)\}')
@@ -205,13 +210,70 @@ def _strip_markup(text: str) -> str:
     return re.sub(r'(?s)<[^>]+>', ' ', text)
 
 
+def _xml_attr(tag: str, name: str) -> str:
+    match = re.search(rf'\b{name}\s*=\s*(["\'])(.*?)\1', tag)
+    return match.group(2) if match else ''
+
+
+def _epub_html_files(archive: zipfile.ZipFile) -> list[str]:
+    """按 OPF 的 spine 顺序找出正文 XHTML。
+
+    有些 EPUB 的正文文件没有 .xhtml 后缀（如 EPUB/xhtml/chapter1），
+    只按扩展名筛选会漏掉整本书，所以优先解析 OPF 清单。
+    """
+    names = set(archive.namelist())
+    try:
+        container = archive.read('META-INF/container.xml').decode('utf-8', 'ignore')
+        opf_path = unquote(_xml_attr(container, 'full-path'))
+        opf = archive.read(opf_path).decode('utf-8', 'ignore')
+        base = posixpath.dirname(opf_path)
+        items: dict[str, tuple[str, str]] = {}
+        for tag in re.findall(r'<item\b[^>]*>', opf):
+            item_id = _xml_attr(tag, 'id')
+            href = _xml_attr(tag, 'href')
+            if not item_id or not href:
+                continue
+            href = unquote(href.split('#')[0])
+            path = posixpath.normpath(posixpath.join(base, href))
+            items[item_id] = (path, _xml_attr(tag, 'media-type').lower())
+        selected: list[str] = []
+        for item_id in re.findall(r'<itemref\b[^>]*>', opf):
+            ref = _xml_attr(item_id, 'idref')
+            item = items.get(ref)
+            if item and item[1] in HTML_MEDIA_TYPES and item[0] in names:
+                selected.append(item[0])
+        for path, media in items.values():
+            if media in HTML_MEDIA_TYPES and path in names and path not in selected:
+                selected.append(path)
+        if selected:
+            return selected
+    except (KeyError, OSError, ValueError):
+        pass
+
+    # 兜底：按扩展名，或无扩展名但内容像 HTML/XML 的文件。
+    fallback: list[str] = []
+    for name in archive.namelist():
+        if name.endswith('/'):
+            continue
+        lower = name.lower()
+        if lower.endswith(('.xhtml', '.html', '.htm', '.xml', '.txt')):
+            fallback.append(name)
+            continue
+        if Path(name).suffix == '' and name != 'mimetype':
+            try:
+                head = archive.read(name)[:512].lstrip().lower()
+            except KeyError:
+                continue
+            if head.startswith(b'<?xml') or b'<html' in head:
+                fallback.append(name)
+    return fallback
+
+
 def _extract_epub_text(path: Path) -> str:
     parts: list[str] = []
     try:
         with zipfile.ZipFile(path) as archive:
-            for name in archive.namelist():
-                if not name.lower().endswith(('.xhtml', '.html', '.htm', '.xml', '.txt')):
-                    continue
+            for name in _epub_html_files(archive):
                 try:
                     content = archive.read(name).decode('utf-8', 'ignore')
                 except KeyError:
@@ -241,7 +303,7 @@ def extract_text(path: Path, calibre: str = '') -> str:
             output = Path(tmp) / 'book.txt'
             try:
                 subprocess.run(
-                    [calibre, str(path), str(output), '--quiet'],
+                    [calibre, str(path), str(output)],
                     capture_output=True, timeout=240, check=False,
                 )
             except (OSError, subprocess.TimeoutExpired):
@@ -274,9 +336,9 @@ def _save_cache(cache: dict) -> None:
 def _cache_key(path: Path) -> str:
     try:
         stat = path.stat()
-        return f'{path}|{stat.st_size}|{int(stat.st_mtime)}'
+        return f'v{WORDS_VERSION}|{path}|{stat.st_size}|{int(stat.st_mtime)}'
     except OSError:
-        return str(path)
+        return f'v{WORDS_VERSION}|{path}'
 
 
 def run_word_count(db, library_dir: str, force: bool = False,
@@ -288,6 +350,7 @@ def run_word_count(db, library_dir: str, force: bool = False,
     calibre = find_calibre()
     cache = _load_cache()
     existing = db.word_count_map('book')
+    stale = db.get_setting('word_count_version') != WORDS_VERSION
 
     candidates: list[dict] = []
     seen: set[str] = set()
@@ -327,7 +390,7 @@ def run_word_count(db, library_dir: str, force: bool = False,
         title = entry['title']
         if progress:
             progress(f'匹配《{title}》', index_number, len(candidates))
-        if entry['word_count'] > 0 and not force:
+        if entry['word_count'] > 0 and not force and not stale:
             stats['cached'] += 1
             stats['matched'] += 1
             stats['total_words'] += entry['word_count']
@@ -338,7 +401,7 @@ def run_word_count(db, library_dir: str, force: bool = False,
             continue
         stats['matched'] += 1
         key = _cache_key(path)
-        word_count = 0 if force else int(cache.get(key, 0) or 0)
+        word_count = 0 if (force or stale) else int(cache.get(key, 0) or 0)
         if word_count > 0:
             stats['cached'] += 1
         else:
@@ -356,5 +419,6 @@ def run_word_count(db, library_dir: str, force: bool = False,
         else:
             stats['failed'] += 1
     _save_cache(cache)
+    db.set_setting('word_count_version', WORDS_VERSION)
     return stats
 

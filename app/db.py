@@ -1704,6 +1704,19 @@ class Database:
                 ''', (folder_id, media_type)).fetchall()
         return {str(row['subject_id']) for row in rows}
 
+    def plan_subject_folders(self, media_type: str) -> dict[str, list[str]]:
+        with self._connect() as conn:
+            rows = conn.execute('''
+                SELECT i.subject_id, f.title FROM plan_items i
+                JOIN plan_folders f ON f.id=i.folder_id AND f.deleted_at=''
+                WHERE i.media_type=? AND i.deleted_at=''
+                ORDER BY f.position, f.id
+            ''', (media_type,)).fetchall()
+        result: dict[str, list[str]] = {}
+        for row in rows:
+            result.setdefault(str(row['subject_id']), []).append(row['title'] or '未命名计划')
+        return result
+
     def remove_plan_item(self, item_id: int) -> None:
         with self._connect() as conn:
             row = conn.execute('SELECT folder_id FROM plan_items WHERE id=?',

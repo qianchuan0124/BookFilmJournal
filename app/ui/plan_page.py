@@ -2,7 +2,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal, QUrl
+from PySide6.QtCore import QSize, Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QProgressBar,
@@ -22,8 +22,8 @@ from app.media_meta import book_stats_text_full, movie_stats_text
 from app.profile import effective_name
 from app.ui.read_stamp import ReadStamp
 from app.ui.segmented import SegmentedSwitch
-from app.ui.styles import progress_style, surface_style, primary_button
-from app.ui.record_card import _cover_pixmap, _two_line_text
+from app.ui.styles import progress_style, search_edit_style, surface_style, primary_button
+from app.ui.record_card import _cover_pixmap, _highlight_html, _two_line_text
 
 SOURCE_LABELS = {'wish': '想看/想读', 'doulist': '豆列', 'manual': '手动'}
 
@@ -59,6 +59,27 @@ def _folder_pixmap(folder, width: int, height: int) -> QPixmap:
     if cover:
         return _cover_pixmap(cover, width, height, fill=True)
     return _folder_placeholder(width, height)
+
+
+def _match_snippet(text: str, keyword: str, radius: int = 30) -> str:
+    """截取关键词附近的简介片段，并把命中的词高亮。"""
+    if not keyword or not text:
+        return ''
+    index = text.lower().find(keyword)
+    if index < 0:
+        return ''
+    start = max(0, index - radius)
+    end = min(len(text), index + len(keyword) + radius)
+    snippet = text[start:end].replace('\n', ' ')
+    prefix = '…' if start > 0 else ''
+    suffix = '…' if end < len(text) else ''
+    return prefix + _highlight_html(snippet, keyword) + suffix
+
+
+def _search_snippet(title: str, intro: str, keyword: str) -> str:
+    if not keyword or keyword in (title or '').lower():
+        return ''
+    return _match_snippet(intro or '', keyword)
 
 
 class PlanFolderCard(QFrame):
@@ -289,45 +310,193 @@ class PlanRow(QFrame):
         super().mouseReleaseEvent(event)
 
 
+class _SearchEdit(LineEdit):
+    """搜索框：回车只结束输入，避免误触发对话框的「添加选中」按钮。"""
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter):
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+
+class PlanCandidateRow(QWidget):
+    """添加条目弹窗中的一行；已加入计划的条目会被锁定并给出提示。"""
+
+    toggled = Signal(int, bool)
+
+    def __init__(self, item_id: int, title: str, meta_text: str, meta_color: str,
+                 hint_text: str, checked: bool, locked: bool, keyword: str = '',
+                 snippet: str = '', parent=None):
+        super().__init__(parent)
+        self.item_id = int(item_id)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        head = QHBoxLayout()
+        head.setContentsMargins(0, 0, 0, 0)
+        head.setSpacing(8)
+        self.checkbox = CheckBox('', self)
+        self.checkbox.setFixedWidth(28)
+        self.checkbox.setChecked(checked and not locked)
+        self.checkbox.setEnabled(not locked)
+        self.checkbox.checkStateChanged.connect(self._on_state)
+        head.addWidget(self.checkbox, 0, Qt.AlignVCenter)
+        self.title_label = BodyLabel(self)
+        self.title_label.setWordWrap(False)
+        self.title_label.setToolTip(title)
+        self.title_label.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        if keyword:
+            self.title_label.setTextFormat(Qt.RichText)
+            self.title_label.setText(_highlight_html(title, keyword))
+        else:
+            self.title_label.setTextFormat(Qt.PlainText)
+            self.title_label.setText(title)
+        if locked:
+            self.title_label.setTextColor('#8d95a5', '#7d8694')
+        else:
+            self.title_label.setCursor(Qt.PointingHandCursor)
+        head.addWidget(self.title_label, 1)
+        layout.addLayout(head)
+
+        if meta_text:
+            meta = CaptionLabel(meta_text, self)
+            meta.setContentsMargins(36, 0, 0, 0)
+            meta.setStyleSheet(f'color:{meta_color};')
+            layout.addWidget(meta)
+        if snippet:
+            matched = CaptionLabel(self)
+            matched.setTextFormat(Qt.RichText)
+            matched.setText('简介：' + snippet)
+            matched.setContentsMargins(36, 0, 0, 0)
+            matched.setStyleSheet('color:#8d95a5;')
+            layout.addWidget(matched)
+        if hint_text:
+            hint = CaptionLabel(hint_text, self)
+            hint.setContentsMargins(36, 0, 0, 0)
+            hint.setStyleSheet('color:#b98900;' if locked else 'color:#8d95a5;')
+            layout.addWidget(hint)
+
+    def _on_state(self, state) -> None:
+        self.toggled.emit(self.item_id, state == Qt.CheckState.Checked)
+
+    def set_checked(self, checked: bool) -> None:
+        self.checkbox.blockSignals(True)
+        self.checkbox.setChecked(checked)
+        self.checkbox.blockSignals(False)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            if self.checkbox.isEnabled():
+                self.checkbox.toggle()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
 class AddWishDialog(MessageBoxBase):
     def __init__(self, db: Database, media_type: str, folder_id: int, parent=None):
         super().__init__(parent)
         self.db = db
         self.media_type = media_type
         self.folder_id = folder_id
-        self.checkboxes = {}
+        self._checked: set[int] = set()
+        self._keyword = ''
         self.widget.setMinimumWidth(720)
         self.yesButton.setText('添加选中')
         self.cancelButton.setText('取消')
         label = '想看' if media_type == 'movie' else '想读'
         self.viewLayout.addWidget(SubtitleLabel(f'从{label}添加到计划', self))
-        hint = CaptionLabel('勾选要加入当前计划的条目；已在该计划中的条目会自动隐藏。', self)
+        hint = CaptionLabel('勾选要加入当前计划的条目；已在当前计划中的条目不可重复添加。', self)
         hint.setTextColor('#5f6b7a', '#8d95a5')
         self.viewLayout.addWidget(hint)
 
+        self.all_rows = db.list_records(media_type, status='wish')
+        self.rows_by_id = {int(row['id']): row for row in self.all_rows}
+        self.existing = db.plan_subject_ids(media_type, folder_id)
+        self.other_folders = db.plan_subject_folders(media_type)
+        self.read_ids = db.done_subject_ids(media_type)
+
+        self.search_edit = _SearchEdit(self)
+        self.search_edit.setPlaceholderText('搜索标题 / 简介')
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setFixedHeight(34)
+        search_edit_style(self.search_edit)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(self._rebuild_items)
+        self.search_edit.textChanged.connect(self._on_search)
+        self.viewLayout.addWidget(self.search_edit)
+
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(380)
+        scroll.setFixedHeight(360)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet('QScrollArea{background:transparent;border:none;}')
-        container = QWidget()
-        container.setStyleSheet('background:transparent;')
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(2, 8, 2, 0)
-        layout.setSpacing(10)
-        existing = db.plan_subject_ids(media_type, folder_id)
-        read_ids = db.done_subject_ids(media_type)
-        rows = [row for row in db.list_records(media_type, status='wish')
-                if str(row['subject_id']) not in existing]
-        if not rows:
-            layout.addWidget(BodyLabel('没有可添加的想读/想看记录。', container))
+        self.container = QWidget()
+        self.container.setStyleSheet('background:transparent;')
+        self.items_layout = QVBoxLayout(self.container)
+        self.items_layout.setContentsMargins(2, 8, 2, 0)
+        self.items_layout.setSpacing(10)
+        scroll.setWidget(self.container)
+        self.viewLayout.addWidget(scroll)
+        self._rebuild_items()
+
+    def _on_search(self, text: str) -> None:
+        self._keyword = (text or '').strip().lower()
+        if not self._keyword:
+            self._search_timer.stop()
+            self._rebuild_items()
+        else:
+            self._search_timer.start()
+
+    def _matches(self, title: str, intro: str = '') -> bool:
+        if not self._keyword:
+            return True
+        return (self._keyword in (title or '').lower()
+                or self._keyword in (intro or '').lower())
+
+    def _plan_hint(self, subject_id: str, locked: bool) -> str:
+        if locked:
+            return '已在当前计划中，不可重复添加'
+        titles = self.other_folders.get(subject_id, [])
+        if not titles:
+            return ''
+        if len(titles) > 1:
+            return f'已在「{titles[0]}」等 {len(titles)} 个计划中'
+        return f'已在「{titles[0]}」计划中'
+
+    def _clear(self) -> None:
+        while self.items_layout.count():
+            item = self.items_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.hide()
+                widget.deleteLater()
+
+    def _rebuild_items(self) -> None:
+        self._clear()
+        rows = [row for row in self.all_rows
+                if self._matches(row['title'], row['intro'])]
+        if not self.all_rows:
+            self.items_layout.addWidget(
+                BodyLabel('没有可添加的想读/想看记录。', self.container)
+            )
+        elif not rows:
+            self.items_layout.addWidget(BodyLabel('没有匹配的条目。', self.container))
         for row in rows:
-            item_widget = QWidget(container)
-            item_layout = QVBoxLayout(item_widget)
-            item_layout.setContentsMargins(0, 0, 0, 0)
-            item_layout.setSpacing(2)
-            checkbox = CheckBox(row['title'], item_widget)
-            is_read = str(row['subject_id']) in read_ids
+            record_id = int(row['id'])
+            subject_id = str(row['subject_id'])
+            locked = subject_id in self.existing
+            is_read = subject_id in self.read_ids
             meta_parts = [
                 _read_text(row['media_type'], is_read),
                 row['effective_date'] or row['marked_date'] or '未设置',
@@ -338,22 +507,31 @@ class AddWishDialog(MessageBoxBase):
                 ))
             elif row['media_type'] == 'movie':
                 meta_parts.append(movie_stats_text(row['intro'] or '', row['subject_id']))
-            meta = CaptionLabel(' · '.join(meta_parts), item_widget)
-            meta.setContentsMargins(26, 0, 0, 0)
-            meta.setStyleSheet('color:#7fae68;' if is_read else 'color:#d98a4a;')
-            item_layout.addWidget(checkbox)
-            item_layout.addWidget(meta)
-            self.checkboxes[int(row['id'])] = (checkbox, row)
-            layout.addWidget(item_widget)
-        layout.addStretch(1)
-        scroll.setWidget(container)
-        self.viewLayout.addWidget(scroll)
+            widget = PlanCandidateRow(
+                record_id, row['title'], ' · '.join(meta_parts),
+                '#7fae68' if is_read else '#d98a4a',
+                self._plan_hint(subject_id, locked),
+                record_id in self._checked, locked,
+                keyword=self._keyword,
+                snippet=_search_snippet(row['title'], row['intro'], self._keyword),
+                parent=self.container,
+            )
+            widget.toggled.connect(self._on_toggled)
+            self.items_layout.addWidget(widget)
+        self.items_layout.addStretch(1)
+
+    def _on_toggled(self, item_id: int, checked: bool) -> None:
+        if checked:
+            self._checked.add(item_id)
+        else:
+            self._checked.discard(item_id)
 
     def validate(self) -> bool:
-        selected = [row for checkbox, row in self.checkboxes.values() if checkbox.isChecked()]
-        if not selected:
-            return True
+        selected = [self.rows_by_id[item_id] for item_id in self._checked
+                    if item_id in self.rows_by_id]
         for row in selected:
+            if str(row['subject_id']) in self.existing:
+                continue
             self.db.add_plan_item({
                 'media_type': self.media_type,
                 'subject_id': row['subject_id'],
@@ -374,14 +552,22 @@ class AddDoulistDialog(MessageBoxBase):
         self.media_type = media_type
         self.folder_id = folder_id
         self.current_doulist = None
-        self.checkboxes = {}
+        self._checked: set[int] = set()
+        self._widgets: dict[int, PlanCandidateRow] = {}
+        self._items_by_id: dict[int, object] = {}
+        self._keyword = ''
         self.word_counts = db.word_count_map('book')
         self.movie_intros = db.intro_map('movie')
+        self.existing = db.plan_subject_ids(media_type, folder_id)
+        self.other_folders = db.plan_subject_folders(media_type)
         self.widget.setMinimumWidth(760)
         self.yesButton.setText('添加选中')
         self.cancelButton.setText('取消')
         self.viewLayout.addWidget(SubtitleLabel('从豆列添加到计划', self))
-        hint = CaptionLabel('选择豆列后勾选条目，可一键全选；只显示与当前计划类型一致的条目。', self)
+        hint = CaptionLabel(
+            '选择豆列后勾选条目，可一键全选；只显示与当前计划类型一致的条目，'
+            '已在当前计划中的条目不可重复添加。', self
+        )
         hint.setTextColor('#5f6b7a', '#8d95a5')
         self.viewLayout.addWidget(hint)
 
@@ -393,10 +579,22 @@ class AddDoulistDialog(MessageBoxBase):
         if not self._lists:
             self.doulist_combo.addItem('暂无可用豆列')
             self.doulist_combo.setEnabled(False)
-        self.doulist_combo.currentIndexChanged.connect(self._rebuild_items)
+        self.doulist_combo.currentIndexChanged.connect(self._on_doulist_changed)
         list_row = QHBoxLayout()
         list_row.setSpacing(10)
         list_row.addWidget(self.doulist_combo, 1)
+        self.search_edit = _SearchEdit(self)
+        self.search_edit.setPlaceholderText('搜索标题 / 简介')
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setFixedWidth(200)
+        self.search_edit.setFixedHeight(34)
+        search_edit_style(self.search_edit)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(150)
+        self._search_timer.timeout.connect(self._rebuild_items)
+        self.search_edit.textChanged.connect(self._on_search)
+        list_row.addWidget(self.search_edit)
         self.select_all = CheckBox('全选', self)
         self.select_all.checkStateChanged.connect(self._set_all_checked)
         self.select_all.setEnabled(False)
@@ -405,7 +603,7 @@ class AddDoulistDialog(MessageBoxBase):
 
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(380)
+        scroll.setFixedHeight(360)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setStyleSheet('QScrollArea{background:transparent;border:none;}')
         self.container = QWidget()
@@ -417,6 +615,34 @@ class AddDoulistDialog(MessageBoxBase):
         self.viewLayout.addWidget(scroll)
         self._rebuild_items()
 
+    def _on_search(self, text: str) -> None:
+        self._keyword = (text or '').strip().lower()
+        if not self._keyword:
+            self._search_timer.stop()
+            self._rebuild_items()
+        else:
+            self._search_timer.start()
+
+    def _matches(self, title: str, intro: str = '') -> bool:
+        if not self._keyword:
+            return True
+        return (self._keyword in (title or '').lower()
+                or self._keyword in (intro or '').lower())
+
+    def _plan_hint(self, subject_id: str, locked: bool) -> str:
+        if locked:
+            return '已在当前计划中，不可重复添加'
+        titles = self.other_folders.get(subject_id, [])
+        if not titles:
+            return ''
+        if len(titles) > 1:
+            return f'已在「{titles[0]}」等 {len(titles)} 个计划中'
+        return f'已在「{titles[0]}」计划中'
+
+    def _on_doulist_changed(self) -> None:
+        self._checked.clear()
+        self._rebuild_items()
+
     def _clear(self) -> None:
         while self.items_layout.count():
             item = self.items_layout.takeAt(0)
@@ -424,62 +650,88 @@ class AddDoulistDialog(MessageBoxBase):
             if widget:
                 widget.hide()
                 widget.deleteLater()
-        self.checkboxes.clear()
+        self._widgets.clear()
 
     def _rebuild_items(self) -> None:
         self._clear()
+        self._items_by_id.clear()
         index = self.doulist_combo.currentIndex()
         if index < 0 or index >= len(self._lists):
+            self.current_doulist = None
             return
         self.current_doulist = self._lists[index]
-        existing = self.db.plan_subject_ids(self.media_type, self.folder_id)
         items = [item for item in self.db.doulist_items(int(self.current_doulist['id']))
-                 if item['media_type'] == self.media_type
-                 and str(item['subject_id']) not in existing]
-        self.select_all.blockSignals(True)
-        self.select_all.setChecked(False)
-        self.select_all.blockSignals(False)
-        self.select_all.setEnabled(bool(items))
-        if not items:
-            self.items_layout.addWidget(BodyLabel('这个豆列没有可添加的条目。', self.container))
-        for item in items:
-            item_widget = QWidget(self.container)
-            item_layout = QVBoxLayout(item_widget)
-            item_layout.setContentsMargins(0, 0, 0, 0)
-            item_layout.setSpacing(2)
-            checkbox = CheckBox(item['title'], item_widget)
+                 if item['media_type'] == self.media_type]
+        self._items_by_id = {int(item['id']): item for item in items}
+        rows = [item for item in items
+                if self._matches(item['title'], item['intro'])]
+        if not rows:
+            text = ('这个豆列没有可添加的条目。' if not items else '没有匹配的条目。')
+            self.items_layout.addWidget(BodyLabel(text, self.container))
+        for item in rows:
+            subject_id = str(item['subject_id'])
+            locked = subject_id in self.existing
             meta_parts = [_read_text(item['media_type'], item['is_read'])]
             if item['media_type'] == 'book':
                 meta_parts.append(book_stats_text_full(
-                    item['subject_id'], self.word_counts.get(str(item['subject_id']), 0)
+                    item['subject_id'], self.word_counts.get(subject_id, 0)
                 ))
             elif item['media_type'] == 'movie':
-                intro = item['intro'] or self.movie_intros.get(str(item['subject_id']), '')
+                intro = item['intro'] or self.movie_intros.get(subject_id, '')
                 meta_parts.append(movie_stats_text(intro, item['subject_id']))
             if item['intro']:
                 meta_parts.append(item['intro'][:80])
-            if meta_parts:
-                meta = CaptionLabel(' · '.join(meta_parts), item_widget)
-                meta.setContentsMargins(26, 0, 0, 0)
-                meta.setStyleSheet('color:#7fae68;' if item['is_read'] else 'color:#d98a4a;')
-                item_layout.addWidget(checkbox)
-                item_layout.addWidget(meta)
-            else:
-                item_layout.addWidget(checkbox)
-            self.checkboxes[int(item['id'])] = (checkbox, item)
-            self.items_layout.addWidget(item_widget)
+            widget = PlanCandidateRow(
+                int(item['id']), item['title'], ' · '.join(meta_parts),
+                '#7fae68' if item['is_read'] else '#d98a4a',
+                self._plan_hint(subject_id, locked),
+                int(item['id']) in self._checked, locked,
+                keyword=self._keyword,
+                snippet=_search_snippet(item['title'], item['intro'], self._keyword),
+                parent=self.container,
+            )
+            widget.toggled.connect(self._on_toggled)
+            self._widgets[int(item['id'])] = widget
+            self.items_layout.addWidget(widget)
         self.items_layout.addStretch(1)
+        self._sync_select_all()
+
+    def _on_toggled(self, item_id: int, checked: bool) -> None:
+        if checked:
+            self._checked.add(item_id)
+        else:
+            self._checked.discard(item_id)
+        self._sync_select_all()
+
+    def _sync_select_all(self) -> None:
+        enabled = [widget for widget in self._widgets.values()
+                   if widget.checkbox.isEnabled()]
+        self.select_all.blockSignals(True)
+        self.select_all.setChecked(
+            bool(enabled) and all(widget.checkbox.isChecked() for widget in enabled)
+        )
+        self.select_all.blockSignals(False)
+        self.select_all.setEnabled(bool(enabled))
 
     def _set_all_checked(self, state) -> None:
         checked = state == Qt.CheckState.Checked
-        for checkbox, _ in self.checkboxes.values():
-            checkbox.setChecked(checked)
+        for item_id, widget in self._widgets.items():
+            if not widget.checkbox.isEnabled():
+                continue
+            widget.set_checked(checked)
+            if checked:
+                self._checked.add(item_id)
+            else:
+                self._checked.discard(item_id)
 
     def validate(self) -> bool:
-        selected = [item for checkbox, item in self.checkboxes.values() if checkbox.isChecked()]
-        if not selected or not self.current_doulist:
+        if not self.current_doulist:
             return True
+        selected = [self._items_by_id[item_id] for item_id in self._checked
+                    if item_id in self._items_by_id]
         for item in selected:
+            if str(item['subject_id']) in self.existing:
+                continue
             self.db.add_plan_item({
                 'media_type': self.media_type,
                 'subject_id': item['subject_id'],
@@ -868,8 +1120,11 @@ class PlanPage(QWidget):
         box.yesButton.setText('删除')
         box.cancelButton.setText('取消')
         if box.exec():
+            scroll_value = self.detail_scroll.verticalScrollBar().value()
             self.db.remove_plan_item(item_id)
             self.refresh()
+            # 刷新会重建列表并把滚动条重置到顶部，这里恢复到删除前的位置。
+            self.detail_scroll.verticalScrollBar().setValue(scroll_value)
 
     def open_item(self, url: str) -> None:
         if url:
