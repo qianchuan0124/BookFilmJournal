@@ -27,7 +27,6 @@ from qfluentwidgets import (
     LineEdit,
     MessageBox,
     PushButton,
-    SmoothScrollArea,
     SwitchButton,
     Theme,
     TitleLabel,
@@ -42,13 +41,14 @@ from app.cloud_sync import (
     check_sync,
     create_snapshot,
     detected_dirs,
+    list_snapshots,
     restore_snapshot,
 )
-from app.config import APP_VERSION, APP_VERSION_TEXT, OUTPUT_DIR, ROOT
+from app.config import APP_VERSION_TEXT, OUTPUT_DIR, ROOT
 from app.db import Database
 from app.douban import cover_file_ok, fetch_cover
 from app.excel import ExcelError, default_export_name, export_excel, import_excel
-from app.media_meta import book_pages, ensure_subject_meta
+from app.media_meta import book_pages, ensure_subject_meta, sync_book_pages
 from app.profile import (
     DEFAULT_NAME,
     avatar_source,
@@ -59,7 +59,8 @@ from app.profile import (
     name_source,
     save_custom_avatar,
 )
-from app.ui.dialogs import CalibreInstallDialog, WordCountDialog
+from app.ui.dialogs import CalibreInstallDialog, SnapshotPickerDialog, WordCountDialog
+from app.ui.scroll_area import SmoothScrollArea
 from app.ui.styles import primary_button
 from app.words import find_calibre, format_word_count
 
@@ -171,6 +172,7 @@ class BackfillWorker(QThread):
         result = ensure_subject_meta(
             'book', missing,
             progress=lambda message, index, total: self.progress.emit(message, index, total),
+            db=self.db,
         )
         return int(result.get('fetched', 0)), int(result.get('failed', 0))
 
@@ -270,7 +272,7 @@ class DataPage(QWidget):
             '应用内不支持登录 iCloud：请先在系统设置登录并开启 iCloud 云盘，'
             'Windows 需安装 iCloud for Windows。备份与恢复都需要手动点击按钮触发，'
             '应用不会自动上传或覆盖数据。快照不包含登录 Cookie；'
-            '封面与页数不随快照同步，恢复后会提示从豆瓣补全。',
+            '封面图片仍保存在本机，换设备后可重新补全；书籍页数已随快照同步。',
             sync_card,)
         sync_hint.setWordWrap(True)
         sync_hint.setTextColor('#5f6b7a', '#8d95a5')
@@ -758,7 +760,10 @@ class DataPage(QWidget):
 
     def backup_to_sync(self) -> None:
         try:
-            result = create_snapshot(self.db, force=True)
+            # 备份前把本机缓存里的历史页数补进数据库；只有用户点备份时才做，
+            # 避免把本地可能过时的数据悄悄写进库并上传。
+            sync_book_pages(self.db, import_local=True)
+            result = create_snapshot(self.db)
         except SyncError as exc:
             InfoBar.error('备份失败', str(exc), parent=self,
                           position=InfoBarPosition.TOP, duration=6000)
@@ -766,6 +771,14 @@ class DataPage(QWidget):
         except Exception as exc:
             InfoBar.error('备份失败', str(exc), parent=self,
                           position=InfoBarPosition.TOP, duration=6000)
+            return
+        if result.get('skipped'):
+            InfoBar.info(
+                '无需备份',
+                '数据库没有新的改动，已跳过；同步目录里保留着之前备份的快照。',
+                parent=self, position=InfoBarPosition.TOP, duration=6000,
+            )
+            self.refresh_sync()
             return
         counts = result.get('counts') or {}
         InfoBar.success(
@@ -783,8 +796,9 @@ class DataPage(QWidget):
             InfoBar.error('读取同步目录失败', str(exc), parent=self,
                           position=InfoBarPosition.TOP, duration=6000)
             return
-        manifest = info.get('manifest')
-        if not info['folder'] or not manifest:
+        folder = Path(info['folder']) if info.get('folder') else None
+        snapshots = list_snapshots(folder)
+        if not snapshots:
             InfoBar.warning(
                 '没有可恢复的备份',
                 '请确认已设置同步目录，并先在另一台设备上执行「立即备份」。',
@@ -793,29 +807,16 @@ class DataPage(QWidget):
             return
         if info.get('missing'):
             InfoBar.warning(
-                '备份尚未就绪', '快照文件还没有完整下载到本机，请稍后再试。',
+                '备份尚未就绪', '最新快照还没有完整下载到本机，可以改选较早的版本或稍后再试。',
                 parent=self, position=InfoBarPosition.TOP, duration=7000,
             )
-            return
-        counts = manifest.get('counts') or {}
-        details = (
-            f"快照时间：{manifest.get('created_at', '未知')}\n"
-            f"来源设备：{manifest.get('device', '未知')}\n"
-            f"记录 {counts.get('records', 0)} 条 · 豆列 {counts.get('doulists', 0)} 个"
-            f" · 计划 {counts.get('plan_items', 0)} 条\n\n"
-            '恢复会覆盖本地数据库；恢复前会把当前数据库自动备份到 data/backups。'
-        )
+        warning = ''
         if info.get('dirty'):
-            details += '\n\n注意：本地有尚未备份的改动，恢复后这些改动将丢失。'
-        app_version = manifest.get('app_version')
-        if app_version and app_version != APP_VERSION:
-            details += (f'\n\n备份来自 v{app_version}（当前 {APP_VERSION_TEXT}），'
-                        '版本不同可能无法完全兼容。')
-        box = MessageBox('从同步目录恢复', details, self.window())
-        box.yesButton.setText('恢复')
-        box.cancelButton.setText('取消')
-        if not box.exec():
+            warning = '注意：本地有尚未备份的改动，恢复后这些改动将丢失。'
+        picker = SnapshotPickerDialog(snapshots, warning, self.window())
+        if not picker.exec():
             return
+        manifest = picker.selected_snapshot()
         try:
             result = restore_snapshot(self.db, manifest)
         except SyncError as exc:
@@ -844,7 +845,7 @@ class DataPage(QWidget):
             missing.append(f'{pages} 本书的页数')
         box = MessageBox(
             '补全封面与页数',
-            '快照不包含封面图片和书籍页数，检测到缺少' + '、'.join(missing) + '。\n\n'
+            '快照包含书籍页数，但封面图片仍保存在本机，检测到缺少' + '、'.join(missing) + '。\n\n'
             '现在从豆瓣公开页面补全吗？补全无需登录；'
             '如果条目无法访问或触发风控，可登录豆瓣后重试。',
             self.window(),

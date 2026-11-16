@@ -133,12 +133,50 @@ def manual_book_pages(subject_id) -> Optional[int]:
     return None
 
 
-def set_book_pages(subject_id, pages: Optional[int]) -> None:
+def set_book_pages(subject_id, pages: Optional[int], db=None) -> None:
     cache = _read_json(BOOK_META_CACHE)
     entry = cache.setdefault(str(subject_id), {})
     entry['pages'] = [str(int(pages))] if pages else []
     entry['pages_manual'] = True
     _write_json(BOOK_META_CACHE, cache)
+    load_book_meta.cache_clear()
+    if db is not None:
+        db.set_book_pages(str(subject_id), pages, manual=True)
+
+
+def _cached_page_entries() -> list[dict]:
+    entries = []
+    for subject_id, entry in _read_json(BOOK_META_CACHE).items():
+        pages = parse_pages(entry.get('pages'))
+        if not pages and not entry.get('pages_manual'):
+            continue
+        entries.append({'subject_id': str(subject_id), 'pages': pages or 0,
+                        'pages_manual': bool(entry.get('pages_manual'))})
+    return entries
+
+
+def sync_book_pages(db, import_local: bool = False) -> None:
+    """数据库是页数的持久来源，本机缓存只作为读取加速。
+
+    import_local=True 时先把本机缓存里的历史页数补进数据库，只在用户显式
+    操作（点击「立即备份」）时调用，避免把本地可能过时的数据悄悄写进库；
+    默认只把数据库里的页数写回本机缓存，用于恢复快照后补齐本机缓存。
+    """
+    if import_local:
+        db.import_book_pages(_cached_page_entries())
+    cache = _read_json(BOOK_META_CACHE)
+    changed = False
+    for entry in db.book_page_entries():
+        item = cache.setdefault(entry['subject_id'], {})
+        values = [str(entry['pages'])] if entry['pages'] else []
+        if item.get('pages') != values:
+            item['pages'] = values
+            changed = True
+        if bool(item.get('pages_manual')) != entry['pages_manual']:
+            item['pages_manual'] = entry['pages_manual']
+            changed = True
+    if changed:
+        _write_json(BOOK_META_CACHE, cache)
     load_book_meta.cache_clear()
 
 
@@ -240,7 +278,7 @@ def _meta_is_complete(media_type: str, entry: Optional[dict]) -> bool:
 
 def ensure_subject_meta(media_type: str, subjects,
                         progress: Optional[Callable[[str, int, int], None]] = None,
-                        delay: float = 0.4) -> dict:
+                        delay: float = 0.4, db=None) -> dict:
     import requests
 
     if media_type not in ('book', 'movie'):
@@ -324,6 +362,10 @@ def ensure_subject_meta(media_type: str, subjects,
                 entry['pages'] = previous.get('pages') or []
                 entry['pages_manual'] = True
             cache[subject_id] = entry
+            if db is not None:
+                # 页数固化进数据库，随快照同步到其他设备，无需再次补全。
+                db.set_book_pages(subject_id, parse_pages(entry['pages']),
+                                  manual=bool(entry.get('pages_manual')))
         else:
             entry = {
                 'intro': data.get('intro') or '',

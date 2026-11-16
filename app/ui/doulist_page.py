@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
 
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, FlowLayout, FluentIcon, InfoBar, InfoBarPosition, MessageBox,
-    PushButton, SmoothScrollArea, StrongBodyLabel, TitleLabel,
+    PushButton, StrongBodyLabel, TitleLabel,
     TransparentToolButton, qconfig,
 )
 
@@ -19,6 +19,7 @@ from app.media_meta import book_stats_text, movie_stats_text
 from app.ui.dialogs import MediaMetaDialog, SyncDialog
 from app.ui.read_stamp import ReadStamp
 from app.ui.record_card import _cover_pixmap, _two_line_text
+from app.ui.scroll_area import SmoothScrollArea
 from app.ui.segmented import SegmentedSwitch
 from app.ui.styles import progress_style, surface_style, primary_button
 

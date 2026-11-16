@@ -964,7 +964,7 @@ def sync_to_db(media_types: list[str], user_id: str, cookie: str, db: Database,
         if not subjects:
             continue
         try:
-            ensure_subject_meta(media_type, subjects.values(), progress)
+            ensure_subject_meta(media_type, subjects.values(), progress, db=db)
         except Exception as exc:
             summary['meta_error'] = str(exc)
     return summary

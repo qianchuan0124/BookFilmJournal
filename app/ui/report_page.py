@@ -10,12 +10,13 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     BodyLabel, CalendarPicker, CaptionLabel, CardWidget, CheckBox, ComboBox,
     InfoBar, InfoBarPosition, MessageBox, ProgressBar,
-    PushButton, SmoothScrollArea, StrongBodyLabel, TitleLabel,
+    PushButton, StrongBodyLabel, TitleLabel,
 )
 
 from app.config import DB_PATH, REPORTS_DIR
 from app.db import Database
 from app.profile import effective_name
+from app.ui.scroll_area import SmoothScrollArea
 from app.ui.styles import primary_button
 
 SCOPE_MONTH = '指定月份'

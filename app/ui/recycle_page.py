@@ -4,13 +4,14 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, ComboBox, InfoBar, InfoBarPosition, MessageBox,
-    PushButton, SmoothScrollArea, StrongBodyLabel, TitleLabel,
+    PushButton, StrongBodyLabel, TitleLabel,
     qconfig,
 )
 
 from app.config import MEDIA_LABELS, MEDIA_NOUNS, READ_LABELS
 from app.db import Database
 from app.ui.record_card import _cover_pixmap
+from app.ui.scroll_area import SmoothScrollArea
 from app.ui.styles import surface_style, primary_button
 
 RELATION_LABELS = {'created': '我创建的', 'followed': '我关注的'}

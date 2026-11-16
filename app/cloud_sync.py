@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import sqlite3
 import sys
 import time
@@ -19,17 +20,23 @@ from pathlib import Path
 from typing import Optional
 
 from app.config import APP_VERSION, DB_PATH
+from app.media_meta import sync_book_pages
 
 SYNC_SUBDIR = '书影记录'
 SNAPSHOT_PREFIX = 'douban_trace_'
 SNAPSHOT_SUFFIX = '.db'
+ICLOUD_STUB_SUFFIX = f'{SNAPSHOT_SUFFIX}.icloud'
 MANIFEST_NAME = 'latest.json'
-SNAPSHOT_KEEP = 8
+SNAPSHOT_KEEP_PER_DEVICE = 3
+SNAPSHOT_NAME_RE = re.compile(
+    rf'^{re.escape(SNAPSHOT_PREFIX)}(\d{{8}}_\d{{6}})_([0-9a-f]{{4}})(?:_\d+)?'
+    rf'{re.escape(SNAPSHOT_SUFFIX)}$'
+)
 LOCAL_BACKUP_KEEP = 5
 
 COUNT_TABLES = (
     'records', 'doulists', 'doulist_items', 'plan_folders', 'plan_items',
-    'book_words', 'ignored_subjects', 'purged_records',
+    'book_words', 'book_meta', 'ignored_subjects', 'purged_records',
 )
 
 # 只属于当前设备的设置：不写进快照，恢复时保留本机值。
@@ -188,23 +195,107 @@ def _write_manifest(folder: Path, manifest: dict) -> None:
     os.replace(temp, folder / MANIFEST_NAME)
 
 
-def _prune_snapshots(folder: Path, keep_name: str) -> None:
-    snapshots = sorted(
-        (path for path in folder.glob(f'{SNAPSHOT_PREFIX}*{SNAPSHOT_SUFFIX}')
-         if path.name != keep_name),
-        key=lambda path: path.name,
-        reverse=True,
-    )
-    for path in snapshots[SNAPSHOT_KEEP - 1:]:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+def _snapshot_info(name: str) -> Optional[dict]:
+    """从快照文件名解析时间与设备标记，格式不符时返回 None。"""
+    match = SNAPSHOT_NAME_RE.match(name)
+    if not match:
+        return None
+    stamp, tag = match.group(1), match.group(2)
+    try:
+        created = datetime.strptime(stamp, '%Y%m%d_%H%M%S')
+    except ValueError:
+        return None
+    return {'snapshot': name, 'tag': tag, 'created': created}
+
+
+def _iter_snapshot_files(folder: Path):
+    """遍历快照文件，同时识别 iCloud 尚未下载的占位文件，产出（真实文件名, 路径, 是否占位）。"""
+    for path in folder.iterdir():
+        name = path.name
+        if name.startswith('.') and name.endswith(ICLOUD_STUB_SUFFIX):
+            real_name = name[1:-len(ICLOUD_STUB_SUFFIX)] + SNAPSHOT_SUFFIX
+            yield real_name, path, True
+        elif name.startswith(SNAPSHOT_PREFIX) and name.endswith(SNAPSHOT_SUFFIX):
+            yield name, path, False
+
+
+def _prune_snapshots(folder: Path) -> None:
+    """每台设备只保留最新的若干份快照，避免同步目录无限增长。"""
+    groups: dict[str, list[str]] = {}
+    for name, _path, _stub in _iter_snapshot_files(folder):
+        info = _snapshot_info(name)
+        if info:
+            groups.setdefault(info['tag'], []).append(name)
+    for names in groups.values():
+        names.sort(reverse=True)
+        for name in names[SNAPSHOT_KEEP_PER_DEVICE:]:
+            try:
+                (folder / name).unlink()
+            except OSError:
+                try:
+                    (folder / f'.{name}.icloud').unlink()
+                except OSError:
+                    pass
 
 
 def _device_tag() -> str:
     name = platform.node() or 'device'
     return hashlib.sha1(name.encode('utf-8')).hexdigest()[:4]
+
+
+def list_snapshots(folder: Optional[Path]) -> list[dict]:
+    """列出同步目录里的全部快照，按时间从新到旧，供用户选择恢复哪一份。"""
+    if folder is None or not folder.is_dir():
+        return []
+    manifest = load_manifest(folder)
+    latest_name = (manifest or {}).get('snapshot', '')
+    own_tag = _device_tag()
+    items = []
+    for name, path, stub in _iter_snapshot_files(folder):
+        info = _snapshot_info(name)
+        if not info:
+            continue
+        created_at = info['created'].strftime('%Y-%m-%d %H:%M:%S')
+        device = '本机' if info['tag'] == own_tag else f'其他设备（{info["tag"]}）'
+        if manifest and name == latest_name:
+            created_at = manifest.get('created_at') or created_at
+            device = manifest.get('device') or device
+        size = 0
+        counts: Optional[dict] = None
+        records_updated = ''
+        if not stub:
+            try:
+                size = path.stat().st_size
+            except OSError:
+                size = 0
+            # 尝试读取快照内的数据统计，供恢复选择界面展示。
+            try:
+                conn = _open_snapshot(path)
+                try:
+                    counts = _counts(conn)
+                    records_updated = _records_updated(conn)
+                finally:
+                    conn.close()
+            except sqlite3.Error:
+                counts = None
+        items.append({
+            'snapshot': name,
+            'tag': info['tag'],
+            'created_at': created_at,
+            'created_ts': int(info['created'].timestamp()),
+            'device': device,
+            'is_mine': info['tag'] == own_tag,
+            'is_latest': name == latest_name,
+            'downloaded': not stub,
+            'size': size,
+            'counts': counts,
+            'records_updated': records_updated,
+            'app_version': (manifest or {}).get('app_version', '')
+            if name == latest_name else '',
+            'sha256': (manifest or {}).get('sha256', '') if name == latest_name else '',
+        })
+    items.sort(key=lambda item: (item['created_ts'], item['snapshot']), reverse=True)
+    return items
 
 
 def _unique_snapshot_name(folder: Path) -> str:
@@ -273,7 +364,7 @@ def create_snapshot(db, force: bool = False) -> dict:
         'records_updated': last_updated,
     }
     _write_manifest(folder, manifest)
-    _prune_snapshots(folder, name)
+    _prune_snapshots(folder)
 
     db.set_setting(SETTING_LAST_STATE, current_state)
     db.set_setting(SETTING_LAST_TIME, manifest['created_at'])
@@ -312,6 +403,8 @@ def _open_snapshot(path: Path) -> sqlite3.Connection:
 
 def validate_snapshot(path: Path) -> dict:
     if not path.is_file():
+        if (path.parent / f'.{path.name}.icloud').is_file():
+            raise SyncError('这份快照还没有下载到本机，请稍候或先在同步目录中打开一次再恢复。')
         raise SyncError('快照文件不存在，可能还在同步中，请稍后再试。')
     try:
         conn = _open_snapshot(path)
@@ -389,6 +482,7 @@ def restore_snapshot(db, manifest: Optional[dict] = None) -> dict:
     for key, value in preserved.items():
         if value:
             db.set_setting(key, value)
+    sync_book_pages(db)
     state = state_id(db.path)
     db.set_setting(SETTING_LAST_STATE, state)
     db.set_setting(SETTING_LAST_TIME, _now_text())

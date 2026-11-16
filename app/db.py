@@ -99,6 +99,12 @@ CREATE TABLE IF NOT EXISTS book_words (
     book_file TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS book_meta (
+    subject_id TEXT PRIMARY KEY,
+    pages INTEGER NOT NULL DEFAULT 0,
+    pages_manual INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT ''
+);
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL DEFAULT ''
@@ -1105,6 +1111,48 @@ class Database:
                 WHERE media_type='book' AND subject_id=? AND deleted_at=''
             ''', (int(word_count or 0), now, str(subject_id)))
         self.set_book_word(subject_id, word_count, book_file)
+
+    def book_page_entries(self) -> list[dict]:
+        """已固化的书籍页数，随数据库快照一起同步。"""
+        with self._connect() as conn:
+            rows = conn.execute('''
+                SELECT subject_id, pages, pages_manual FROM book_meta
+                WHERE pages>0 OR pages_manual=1
+                ORDER BY subject_id
+            ''').fetchall()
+        return [{'subject_id': str(row['subject_id']),
+                 'pages': int(row['pages'] or 0),
+                 'pages_manual': bool(row['pages_manual'])} for row in rows]
+
+    def set_book_pages(self, subject_id: str, pages: Optional[int],
+                       manual: bool = False) -> None:
+        with self._connect() as conn:
+            conn.execute('''
+                INSERT INTO book_meta(subject_id, pages, pages_manual, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(subject_id) DO UPDATE SET
+                    pages=excluded.pages,
+                    pages_manual=excluded.pages_manual,
+                    updated_at=excluded.updated_at
+            ''', (str(subject_id), max(0, int(pages or 0)), 1 if manual else 0, _now()))
+
+    def import_book_pages(self, entries: Iterable[dict]) -> int:
+        """把本机缓存里的历史页数首次写进数据库；已有记录不覆盖。"""
+        now = _now()
+        saved = 0
+        with self._connect() as conn:
+            for entry in entries:
+                pages = max(0, int(entry.get('pages') or 0))
+                if pages <= 0 and not entry.get('pages_manual'):
+                    continue
+                cursor = conn.execute('''
+                    INSERT INTO book_meta(subject_id, pages, pages_manual, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(subject_id) DO NOTHING
+                ''', (str(entry['subject_id']), pages,
+                      1 if entry.get('pages_manual') else 0, now))
+                saved += max(0, cursor.rowcount)
+        return saved
 
     def doulist_book_entries(self) -> list[sqlite3.Row]:
         with self._connect() as conn:

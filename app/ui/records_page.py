@@ -5,7 +5,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, FlowLayout, FluentIcon, InfoBar, InfoBarPosition, LineEdit,
-    CalendarPicker, MessageBox, PushButton, SmoothScrollArea, StrongBodyLabel,
+    CalendarPicker, MessageBox, PushButton, StrongBodyLabel,
     TitleLabel, isDarkTheme,
 )
 
@@ -16,6 +16,7 @@ from app.ui.dialogs import (
     WordCountDialog,
 )
 from app.ui.record_card import RecordCard
+from app.ui.scroll_area import SmoothScrollArea
 from app.ui.segmented import SegmentedSwitch
 from app.ui.styles import primary_button, search_edit_style
 

@@ -4,23 +4,28 @@ import sqlite3
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QPainter, QPixmap
+from PySide6.QtCore import QDate, QModelIndex, QPoint, QRectF, QThread, Qt, QUrl, Signal
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QScrollArea,
-    QSizePolicy, QVBoxLayout, QWidget,
+    QSizePolicy, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from qfluentwidgets import (
     Action, BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon, InfoBar, InfoBarPosition,
-    LineEdit, RoundMenu,
+    IndicatorMenuItemDelegate, LineEdit, MenuAnimationType, RoundMenu,
     IndeterminateProgressRing, MessageBoxBase, ProgressBar, PushButton,
     StrongBodyLabel, SubtitleLabel,
     TextEdit, CalendarPicker, qconfig,
 )
+from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
+from qfluentwidgets.common.font import getFont
+from qfluentwidgets.common.style_sheet import themeColor
 
 from app.calibre_install import install_calibre
-from app.config import COVERS_DIR, DB_PATH, MEDIA_LABELS, READ_LABELS, ROOT
+from app.config import (
+    APP_VERSION, APP_VERSION_TEXT, COVERS_DIR, DB_PATH, MEDIA_LABELS, READ_LABELS, ROOT,
+)
 from app.db import Database
 from app.douban import (
     extract_user_id_from_cookie, fetch_cover, fetch_subject_detail, sync_to_db,
@@ -427,7 +432,7 @@ class EditRecordDialog(MessageBoxBase):
         if self.field_override_checkbox.isChecked():
             self.db.clear_field_overrides(record_id)
         if pages:
-            set_book_pages(self.record['subject_id'], pages)
+            set_book_pages(self.record['subject_id'], pages, db=self.db)
         if minutes:
             set_movie_duration(self.record['subject_id'], minutes)
         return True
@@ -512,7 +517,8 @@ class MediaMetaDialog(MessageBoxBase):
 
     def validate(self) -> bool:
         if self.media_type == 'book':
-            set_book_pages(self.subject_id, self._to_int(self.pages_edit.text()) or None)
+            set_book_pages(self.subject_id, self._to_int(self.pages_edit.text()) or None,
+                           db=self.db)
             self.db.set_word_count_for_subject(
                 self.subject_id, self._to_int(self.word_edit.text()))
         else:
@@ -1659,7 +1665,7 @@ class AddRecordDialog(MessageBoxBase):
                             parent=self, position=InfoBarPosition.TOP)
             return False
         if pages:
-            set_book_pages(subject_id, pages)
+            set_book_pages(subject_id, pages, db=self.db)
         if minutes:
             set_movie_duration(subject_id, minutes)
         return True
@@ -1708,6 +1714,226 @@ class CalibreInstallWorker(QThread):
             self.succeeded.emit(path)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class TwoLineSnapshotDelegate(IndicatorMenuItemDelegate):
+    """快照下拉项的两行委托：第一行主信息，第二行小字数据概况。"""
+
+    def paint(self, painter: QPainter, option, index: QModelIndex):
+        # 绘制背景（选中 / 悬停高亮）
+        style = option.widget.style() if option.widget else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter, option.widget)
+
+        action = index.data(Qt.UserRole)
+        snapshot = action.data() if isinstance(action, QAction) else None
+        selected = bool(option.state & QStyle.State_Selected)
+        palette = option.palette
+
+        painter.save()
+        painter.setRenderHints(QPainter.TextAntialiasing)
+
+        # 主文字颜色：选中用 HighlightedText，否则用 Text，均随主题自适应
+        text_color = palette.color(QPalette.HighlightedText if selected else QPalette.Text)
+
+        # 第一行：主信息
+        painter.setFont(getFont(14))
+        painter.setPen(text_color)
+        main_rect = QRectF(option.rect.x() + 16, option.rect.y() + 7,
+                           option.rect.width() - 32, 20)
+        painter.drawText(main_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                         index.data(Qt.DisplayRole) or '')
+
+        # 第二行：数据概况（小字），用主文字色的半透明版本，保证两种主题下都清晰
+        summary = SnapshotPickerDialog._brief_counts(snapshot) if snapshot else ''
+        if summary:
+            painter.setFont(getFont(11))
+            sub_color = QColor(text_color)
+            sub_color.setAlpha(160)
+            painter.setPen(sub_color)
+            sub_rect = QRectF(option.rect.x() + 16, option.rect.y() + 28,
+                              option.rect.width() - 32, 16)
+            painter.drawText(sub_rect, Qt.AlignLeft | Qt.AlignVCenter, summary)
+
+        painter.restore()
+
+        # 选中指示条
+        if selected:
+            painter.save()
+            painter.setRenderHints(QPainter.Antialiasing)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(themeColor())
+            cy = option.rect.y() + option.rect.height() // 2
+            painter.drawRoundedRect(6, cy - 8, 3, 16, 1.5, 1.5)
+            painter.restore()
+
+
+class SnapshotComboBox(ComboBox):
+    """快照选择下拉框：下拉项两行显示，主信息 + 小字数据概况。"""
+
+    def _createComboMenu(self):
+        menu = ComboBoxMenu(self)
+        # 两行显示需要更高的菜单项，并替换为两行委托
+        menu.setItemHeight(56)
+        menu.view.setItemDelegate(TwoLineSnapshotDelegate(menu.view))
+        return menu
+
+    def _showComboMenu(self):
+        if not self.items:
+            return
+        menu = self._createComboMenu()
+        for item in self.items:
+            action = QAction(item.icon, item.text)
+            action.setEnabled(item.isEnabled)
+            action.setData(item.userData)
+            menu.addAction(action)
+
+        menu.view.itemClicked.connect(
+            lambda i: self._onItemClicked(self.findText(i.text().lstrip())))
+
+        if menu.view.width() < self.width():
+            menu.view.setMinimumWidth(self.width())
+            menu.adjustSize()
+
+        menu.setMaxVisibleItems(self.maxVisibleItems())
+        menu.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        menu.closedSignal.connect(self._onDropMenuClosed)
+        self.dropMenu = menu
+
+        if self.currentIndex() >= 0 and self.items:
+            menu.setDefaultAction(menu.actions()[self.currentIndex()])
+
+        x = -menu.width() // 2 + menu.layout().contentsMargins().left() + self.width() // 2
+        pd = self.mapToGlobal(QPoint(x, self.height()))
+        hd = menu.view.heightForAnimation(pd, MenuAnimationType.DROP_DOWN)
+        pu = self.mapToGlobal(QPoint(x, 0))
+        hu = menu.view.heightForAnimation(pu, MenuAnimationType.PULL_UP)
+
+        if hd >= hu:
+            menu.view.adjustSize(pd, MenuAnimationType.DROP_DOWN)
+            menu.exec(pd, aniType=MenuAnimationType.DROP_DOWN)
+        else:
+            menu.view.adjustSize(pu, MenuAnimationType.PULL_UP)
+            menu.exec(pu, aniType=MenuAnimationType.PULL_UP)
+
+
+class SnapshotPickerDialog(MessageBoxBase):
+    """列出同步目录中的快照，让用户自己选择要从哪一份恢复。"""
+
+    def __init__(self, snapshots: list[dict], warning: str = '', parent=None):
+        super().__init__(parent)
+        self.snapshots = snapshots
+        self.widget.setFixedWidth(560)
+        self.yesButton.setText('恢复此备份')
+        self.cancelButton.setText('取消')
+        self.viewLayout.setSpacing(10)
+        self.viewLayout.addWidget(SubtitleLabel('从同步目录恢复', self))
+        hint = CaptionLabel(
+            '每台设备最多保留 3 份快照。恢复会用所选快照覆盖本机数据库，'
+            '覆盖前会把当前数据库自动备份到 data/backups。',
+            self,
+        )
+        hint.setWordWrap(True)
+        hint.setTextColor('#5f6b7a', '#8d95a5')
+        self.viewLayout.addWidget(hint)
+
+        self.combo = SnapshotComboBox(self)
+        for snapshot in snapshots:
+            self.combo.addItem(self._label(snapshot), userData=snapshot)
+        self.combo.setCurrentIndex(0)
+        self.combo.setFixedWidth(500)
+        self.viewLayout.addWidget(self.combo)
+
+        self.detail = CaptionLabel('', self)
+        self.detail.setWordWrap(True)
+        self.detail.setTextColor('#4b5563', '#5d6474')
+        self.viewLayout.addWidget(self.detail)
+
+        if warning:
+            warn_label = CaptionLabel(warning, self)
+            warn_label.setWordWrap(True)
+            warn_label.setTextColor('#b45309', '#e5b45f')
+            self.viewLayout.addWidget(warn_label)
+
+        self.combo.currentIndexChanged.connect(self._refresh_detail)
+        self._refresh_detail()
+
+    @staticmethod
+    def _brief_counts(snapshot: dict) -> str:
+        """从快照的 counts 字段生成一行简短的数据概况，给下拉选项做小字说明。"""
+        counts = snapshot.get('counts')
+        if not isinstance(counts, dict):
+            if not snapshot.get('downloaded', True):
+                return '未下载'
+            return ''
+        parts = [f"{counts.get('records', 0)}条记录"]
+        doulists = counts.get('doulists', 0)
+        if doulists:
+            parts.append(f"{doulists}个豆列")
+        plan_items = counts.get('plan_items', 0)
+        if plan_items:
+            parts.append(f"{plan_items}项计划")
+        book_words = counts.get('book_words', 0)
+        if book_words:
+            parts.append(f"{book_words}本字数")
+        return ' · '.join(parts)
+
+    @staticmethod
+    def _label(snapshot: dict) -> str:
+        """下拉项第一行：时间 · 设备（最新标记）。数据概况由委托另起一行小字绘制。"""
+        created = snapshot.get('created_at') or '未知时间'
+        device = snapshot.get('device') or '未知设备'
+        marker = '（最新）' if snapshot.get('is_latest') else ''
+        return f'{created} · {device}{marker}'
+
+    @staticmethod
+    def _size_text(size: int) -> str:
+        if size >= 1024 * 1024:
+            return f'{size / 1048576:.1f} MB'
+        return f'{max(1, round(size / 1024))} KB'
+
+    def selected_snapshot(self) -> dict:
+        index = max(0, self.combo.currentIndex())
+        return self.snapshots[index]
+
+    def _refresh_detail(self) -> None:
+        item = self.selected_snapshot()
+        lines: list[str] = []
+        counts = item.get('counts')
+        if isinstance(counts, dict):
+            data_parts = [f"{counts.get('records', 0)} 条记录"]
+            doulists = counts.get('doulists', 0)
+            doulist_items = counts.get('doulist_items', 0)
+            if doulists or doulist_items:
+                data_parts.append(f"{doulists} 个豆列（{doulist_items} 条）")
+            plan_folders = counts.get('plan_folders', 0)
+            plan_items = counts.get('plan_items', 0)
+            if plan_folders or plan_items:
+                data_parts.append(f"{plan_items} 项计划（{plan_folders} 个清单）")
+            book_words = counts.get('book_words', 0)
+            if book_words:
+                data_parts.append(f"{book_words} 本字数统计")
+            book_meta = counts.get('book_meta', 0)
+            if book_meta:
+                data_parts.append(f"{book_meta} 条书籍元数据")
+            updated = item.get('records_updated') or ''
+            if updated:
+                data_parts.append(f"最近更新 {updated[:16]}")
+            lines.append('数据：' + ' · '.join(data_parts))
+        elif not item.get('downloaded', True):
+            lines.append('数据：尚未下载到本机，恢复时可能要先等待同步')
+
+        meta_parts = [f"文件 {item.get('snapshot', '')}"]
+        if item.get('downloaded', True):
+            meta_parts.append(self._size_text(int(item.get('size') or 0)))
+        else:
+            meta_parts.append('未下载')
+        version = item.get('app_version') or ''
+        if version:
+            meta_parts.append(f'由 v{version} 创建')
+            if version != APP_VERSION:
+                meta_parts.append(f'与当前 {APP_VERSION_TEXT} 不同，可能不完全兼容')
+        lines.append(' · '.join(meta_parts))
+        self.detail.setText('\n'.join(lines))
 
 
 class CalibreInstallDialog(MessageBoxBase):
