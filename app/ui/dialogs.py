@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QModelIndex, QPoint, QRectF, QThread, Qt, QUrl, Signal
-from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QScrollArea,
     QSizePolicy, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
@@ -16,7 +16,7 @@ from qfluentwidgets import (
     IndicatorMenuItemDelegate, LineEdit, MenuAnimationType, RoundMenu,
     IndeterminateProgressRing, MessageBoxBase, ProgressBar, PushButton,
     StrongBodyLabel, SubtitleLabel,
-    TextEdit, CalendarPicker, qconfig,
+    TextEdit, CalendarPicker, qconfig, isDarkTheme,
 )
 from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
 from qfluentwidgets.common.font import getFont
@@ -1719,6 +1719,24 @@ class CalibreInstallWorker(QThread):
 class TwoLineSnapshotDelegate(IndicatorMenuItemDelegate):
     """快照下拉项的两行委托：第一行主信息，第二行小字数据概况。"""
 
+    @staticmethod
+    def _text_color(option) -> QColor:
+        """菜单项文字颜色。
+
+        不能用 option.palette：qfluentwidgets 的菜单项颜色只写在 menu.qss 里，
+        控件调色板跟随的是系统外观，和应用内的亮暗主题无关。亮色主题下选中项
+        会取到系统调色板的白色 HighlightedText，压在浅色高亮条上完全看不见；
+        暗色主题下普通项又会拿到黑字。这里直接按主题给出与 menu.qss 一致的颜色。
+        """
+        dark = isDarkTheme()
+        if not option.state & QStyle.State_Enabled:
+            return QColor(255, 255, 255, 102) if dark else QColor(0, 0, 0, 112)
+        if option.state & QStyle.State_Selected:
+            # 对应 QSS 的 ::item:selected / ::item:selected:active
+            alpha = 178 if option.state & QStyle.State_Active else 255
+            return QColor(255, 255, 255, alpha) if dark else QColor(0, 0, 0, alpha)
+        return QColor(255, 255, 255) if dark else QColor(0, 0, 0)
+
     def paint(self, painter: QPainter, option, index: QModelIndex):
         # 绘制背景（选中 / 悬停高亮）
         style = option.widget.style() if option.widget else QApplication.style()
@@ -1727,13 +1745,12 @@ class TwoLineSnapshotDelegate(IndicatorMenuItemDelegate):
         action = index.data(Qt.UserRole)
         snapshot = action.data() if isinstance(action, QAction) else None
         selected = bool(option.state & QStyle.State_Selected)
-        palette = option.palette
 
         painter.save()
         painter.setRenderHints(QPainter.TextAntialiasing)
 
-        # 主文字颜色：选中用 HighlightedText，否则用 Text，均随主题自适应
-        text_color = palette.color(QPalette.HighlightedText if selected else QPalette.Text)
+        # 主文字颜色按亮暗主题取，避免亮色下选中项白字压浅色高亮
+        text_color = self._text_color(option)
 
         # 第一行：主信息
         painter.setFont(getFont(14))
@@ -1748,7 +1765,7 @@ class TwoLineSnapshotDelegate(IndicatorMenuItemDelegate):
         if summary:
             painter.setFont(getFont(11))
             sub_color = QColor(text_color)
-            sub_color.setAlpha(160)
+            sub_color.setAlpha(min(160, text_color.alpha()))
             painter.setPen(sub_color)
             sub_rect = QRectF(option.rect.x() + 16, option.rect.y() + 28,
                               option.rect.width() - 32, 16)
