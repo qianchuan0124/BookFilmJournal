@@ -273,6 +273,7 @@ class RecordCard(CardWidget):
         self.comment = record['comment'] or ''
         self.setFixedWidth(214)
         self.setBorderRadius(12)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setClickEnabled(True)
         self.setCursor(Qt.PointingHandCursor)
         self.clicked.connect(lambda: self.detail_requested.emit(int(self.record['id'])))
@@ -342,8 +343,8 @@ class RecordCard(CardWidget):
         )
         comment_label.setTextColor('#5f6b7a', '#8d95a5')
         comment_label.setToolTip(self.comment)
-        # 没有短评时也保留这段高度，保证所有卡片等高，批量加载时不会忽高忽低。
-        comment_label.setVisible(True)
+        # 没有短评就不占位：无短评卡片整体更矮，中间不留空白。
+        comment_label.setVisible(bool(self.comment))
         self.comment_label = comment_label
         layout.addWidget(comment_label)
         layout.addStretch(1)
@@ -449,8 +450,17 @@ class RecordCard(CardWidget):
             self.comment_label.setToolTip(self.comment)
         else:
             self.comment_text = ''
-        self.comment_label.setVisible(True)
+        self.comment_label.setVisible(bool(self.comment))
+        self._sync_height()
         self.set_highlight(highlight)
+
+    def _sync_height(self) -> None:
+        """短评出现/消失后重新计算卡片高度；没有短评的卡片不再预留三行。"""
+        self.layout().activate()
+        height = self.sizeHint().height()
+        if height > 0 and height != self.height():
+            self.setFixedHeight(height)
+            self.updateGeometry()
 
     def set_highlight(self, keyword: str) -> None:
         self.highlight = (keyword or '').strip()
@@ -469,12 +479,32 @@ class RecordCard(CardWidget):
     def _normalBackgroundColor(self):
         return QColor(255, 255, 255, 13 if isDarkTheme() else 235)
 
+    def _backdrop_color(self) -> QColor:
+        """卡片下方（窗口）的底色，用于把半透明卡片压成不透明色。"""
+        color = getattr(self.window(), 'backgroundColor', None)
+        if isinstance(color, QColor):
+            return QColor(color)
+        return QColor(32, 32, 32) if isDarkTheme() else QColor(243, 243, 243)
+
+    @staticmethod
+    def _flatten(color: QColor, backdrop: QColor) -> QColor:
+        alpha = color.alphaF()
+        return QColor(
+            round(color.red() * alpha + backdrop.red() * (1 - alpha)),
+            round(color.green() * alpha + backdrop.green() * (1 - alpha)),
+            round(color.blue() * alpha + backdrop.blue() * (1 - alpha)),
+        )
+
     def paintEvent(self, event) -> None:
+        # 卡片背景本身是半透明的，直接绘制会和上一帧像素叠加，在 macOS 上
+        # 局部重绘后留下文字残影。先铺一层不透底的颜色再画圆角卡片。
+        backdrop = self._backdrop_color()
         painter = QPainter(self)
         painter.setRenderHints(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), backdrop)
         rect = self.rect().adjusted(0, 0, -1, -1)
         painter.setPen(Qt.NoPen)
-        painter.setBrush(self.backgroundColor)
+        painter.setBrush(self._flatten(self.backgroundColor, backdrop))
         painter.drawRoundedRect(rect, self.borderRadius, self.borderRadius)
         if not isDarkTheme():
             painter.setBrush(Qt.NoBrush)

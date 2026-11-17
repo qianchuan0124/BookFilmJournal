@@ -1,12 +1,15 @@
 from datetime import datetime
 
-from PySide6.QtCore import QPoint, QTimer, Qt, Signal
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QVBoxLayout, QWidget
+from PySide6.QtCore import QPoint, QSize, QTimer, Qt, Signal
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
+    QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QVBoxLayout, QWidget,
+)
 
 from qfluentwidgets import (
     BodyLabel, CaptionLabel, FlowLayout, FluentIcon, InfoBar, InfoBarPosition, LineEdit,
     CalendarPicker, MessageBox, PushButton, StrongBodyLabel,
-    TitleLabel, isDarkTheme,
+    TitleLabel, TransparentToolButton, isDarkTheme,
 )
 
 from app.config import MEDIA_LABELS, MEDIA_NOUNS
@@ -49,6 +52,7 @@ class RecordsPage(QWidget):
         self._had_search = False
         self._restore_scroll = 0
         self._pump_scheduled_for = None
+        self._reflow_scheduled = False
         self.status = 'done'
         self.cards: list[RecordCard] = []
         self._groups = []
@@ -129,6 +133,23 @@ class RecordsPage(QWidget):
         self.content_layout.addStretch(1)
         self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll, 1)
+
+        # 右下角悬浮的「回到顶部」按钮，只在向下滚动后出现。
+        self.back_to_top = TransparentToolButton(FluentIcon.UP, self)
+        self.back_to_top.setObjectName('backToTop')
+        self.back_to_top.setFixedSize(40, 40)
+        self.back_to_top.setIconSize(QSize(16, 16))
+        self.back_to_top.setCursor(Qt.PointingHandCursor)
+        self.back_to_top.setToolTip('回到顶部')
+        self.back_to_top.clicked.connect(self.scroll_to_top)
+        shadow = QGraphicsDropShadowEffect(self.back_to_top)
+        shadow.setBlurRadius(24)
+        shadow.setOffset(0, 3)
+        shadow.setColor(QColor(0, 0, 0, 90))
+        self.back_to_top.setGraphicsEffect(shadow)
+        self.back_to_top.setStyleSheet(self._back_to_top_style())
+        self.back_to_top.hide()
+        self.scroll.verticalScrollBar().valueChanged.connect(self._update_back_to_top)
 
         # 首次显示时再加载记录，避免启动阶段构建全部卡片。
         self._dirty = True
@@ -239,6 +260,9 @@ class RecordsPage(QWidget):
         entry.update(header=header, group=group_widget, flow=flow)
         view['groups'].append((header, count, group_widget, entry['cards'], entry['date']))
         view['lines'].append(line)
+        # 新分组的高度依赖 FlowLayout 的 widthForHeight，不重排会一直保持 0 高度，
+        # 表现为只剩日期标题、卡片不显示。
+        self._reflow()
 
     def _add_cards(self, view: dict, budget: int) -> int:
         """按预算补充卡片，返回仍未创建的条目数。"""
@@ -310,6 +334,45 @@ class RecordsPage(QWidget):
         for view in self.views.values():
             for line in view['lines']:
                 line.setStyleSheet(f'background: {color};')
+        self.back_to_top.setStyleSheet(self._back_to_top_style())
+
+    @staticmethod
+    def _back_to_top_style() -> str:
+        if isDarkTheme():
+            return ('#backToTop { background-color: #323232;'
+                    ' border: 1px solid rgba(255,255,255,0.10); border-radius: 20px; }'
+                    '#backToTop:hover { background-color: #3c3c3c;'
+                    ' border: 1px solid rgba(255,255,255,0.18); }')
+        return ('#backToTop { background-color: #ffffff;'
+                ' border: 1px solid rgba(15,23,42,0.22); border-radius: 20px; }'
+                '#backToTop:hover { background-color: #ffffff;'
+                ' border: 1px solid rgba(15,23,42,0.40); }')
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._place_back_to_top()
+
+    def _place_back_to_top(self) -> None:
+        button = self.back_to_top
+        button.move(self.width() - button.width() - 32,
+                    self.height() - button.height() - 24)
+        button.raise_()
+
+    def _update_back_to_top(self) -> None:
+        shown = self.scroll.verticalScrollBar().value() > 240
+        if not shown:
+            self.back_to_top.hide()
+            return
+        self._place_back_to_top()
+        self.back_to_top.show()
+
+    def scroll_to_top(self) -> None:
+        delegate = getattr(self.scroll, 'delegate', None)
+        smooth = getattr(delegate, 'vScrollBar', None)
+        if smooth is not None:
+            smooth.scrollTo(0)
+        else:
+            self.scroll.verticalScrollBar().setValue(0)
 
     def _show_status(self, status: str, reset_scroll: bool = False) -> None:
         view = self.views.get(status)
@@ -493,9 +556,14 @@ class RecordsPage(QWidget):
             smooth.resetValue(bar.value())
 
     def _reflow(self) -> None:
+        # 合并多次请求：补齐卡片时每个新分组都会触发一次，避免排一堆重复的重排。
+        if self._reflow_scheduled:
+            return
+        self._reflow_scheduled = True
         QTimer.singleShot(0, self._reflow_now)
 
     def _reflow_now(self) -> None:
+        self._reflow_scheduled = False
         view = self.current_view
         if view is None:
             return
@@ -506,6 +574,10 @@ class RecordsPage(QWidget):
             view['widget'].layout().invalidate()
             view['widget'].updateGeometry()
             self.content_layout.invalidate()
+            self.content_layout.activate()
+            # 分批补卡时滚动区会先按旧内容高度压缩分组，卡片看起来在慢慢变高。
+            # 这里同步把容器最小高度更新为最新内容高度，避免被压缩。
+            self.container.setMinimumHeight(self.content_layout.sizeHint().height())
         except RuntimeError:
             pass
 

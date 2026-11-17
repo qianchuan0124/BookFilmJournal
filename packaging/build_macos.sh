@@ -40,7 +40,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-ditto "$APP" "$STAGE/书影记录.app"
+ditto --norsrc --noextattr "$APP" "$STAGE/书影记录.app"
 ln -s /Applications "$STAGE/Applications"
 .venv/bin/python packaging/dmg_background.py "$STAGE/.background"
 
@@ -73,25 +73,25 @@ tell application "Finder"
     set toolbar visible of container window to false
     set statusbar visible of container window to false
     set sidebar width of container window to 0
-    set the bounds of container window to {200, 100, 840, 540}
+    set the bounds of container window to {200, 100, 840, 560}
     set opts to the icon view options of container window
     set arrangement of opts to not arranged
     set icon size of opts to 96
     set text size of opts to 12
     set background picture of opts to ((POSIX file "$MOUNT_POINT/.background/background.tiff") as alias)
     -- 背景设置后再次指定窗口尺寸，避免 Finder 重置为小尺寸。
-    set the bounds of container window to {200, 100, 840, 540}
+    set the bounds of container window to {200, 100, 840, 560}
     delay 2
     -- 窗口图标尚未渲染完成时设置 position 会失败，重试几次。
     repeat 10 times
       try
-        set position of item "Applications" of container window to {490, 190}
+        set position of item "Applications" of container window to {470, 200}
         exit repeat
       on error
         delay 1
       end try
     end repeat
-    set position of item "书影记录.app" of container window to {150, 190}
+    set position of item "书影记录.app" of container window to {170, 200}
     update without registering applications
     delay 1
     close
@@ -112,17 +112,76 @@ EOF
     -o "dist/${NAME}.dmg" -quiet || return 1
 }
 
+detach_volume() {
+  hdiutil info | awk -v v="$VOLNAME" '$0 ~ "Apple_HFS" && $0 ~ v {print $2}' | while read -r dev; do
+    hdiutil detach "$dev" -quiet -force 2>/dev/null || true
+  done
+  hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
+}
+
+build_plain_dmg() {
+  # 最简兜底：不含 .DS_Store，只保证产出一个可用的 DMG。
+  hdiutil makehybrid -quiet -hfs -hfs-volume-name "$VOLNAME" \
+    -o "$RAW_DIR/${NAME}" "$STAGE" || return 1
+  hdiutil convert "$RAW_DIR/${NAME}.dmg" -format UDZO -o "dist/${NAME}.dmg" -quiet
+}
+
+build_dmg_with_generated_layout() {
+  # 不支持 Finder 排版时的方案：
+  # 1) 离线生成只读镜像（不挂载）；
+  # 2) 只读挂载后生成真实的背景别名（此时卷内文件已存在，别名记录卷内相对路径）；
+  # 3) 转成可写镜像并扩容，在很短的挂载窗口里写入 .DS_Store；
+  # 4) 压回最终 DMG。
+  # 注意：别名必须用标准挂载点 /Volumes/<卷名> 生成，否则 Finder 解析不到背景图。
+  MOUNT_POINT="/Volumes/$VOLNAME"
+  detach_volume
+  hdiutil makehybrid -quiet -hfs -hfs-volume-name "$VOLNAME" \
+    -o "$RAW_DIR/ro" "$STAGE" || return 1
+  hdiutil attach "$RAW_DIR/ro.dmg" -readonly -noverify -noautoopen -quiet || return 1
+  if ! .venv/bin/python packaging/dmg_layout.py "$MOUNT_POINT" "书影记录.app" \
+      --save-alias "$RAW_DIR/alias.bin"; then
+    hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
+    return 1
+  fi
+  hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
+
+  hdiutil convert "$RAW_DIR/ro.dmg" -format UDRW -o "$RAW_DIR/rw.dmg" -quiet || return 1
+  hdiutil resize -size 1g "$RAW_DIR/rw.dmg" >/dev/null 2>&1 || return 1
+  hdiutil attach "$RAW_DIR/rw.dmg" -readwrite -noverify -noautoopen -quiet || return 1
+  if ! .venv/bin/python packaging/dmg_layout.py "$MOUNT_POINT" "书影记录.app" \
+      --alias "$RAW_DIR/alias.bin"; then
+    hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
+    return 1
+  fi
+  hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
+  hdiutil convert "$RAW_DIR/rw.dmg" -format UDZO -o "dist/${NAME}.dmg" -quiet || return 1
+}
+
+# .DS_Store 布局依赖 ds-store / mac-alias，属于可选增强：缺失时跳过自定义布局继续出包。
+LAYOUT_DEPS_OK=1
+if ! .venv/bin/python -c "import ds_store, mac_alias" >/dev/null 2>&1; then
+  LAYOUT_DEPS_OK=0
+  echo "提示：未安装 ds-store / mac-alias，本次跳过自定义布局；" \
+       "补装：.venv/bin/python -m pip install -r requirements-build.txt" >&2
+fi
+
 if build_dmg_with_layout; then
   echo "DMG 安装界面布局完成"
 else
-  echo "警告：带布局的 DMG 生成失败，回退到简单镜像" >&2
   if [ -n "$MOUNT_POINT" ]; then
     hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
     MOUNT_POINT=""
   fi
-  hdiutil makehybrid -quiet -hfs -hfs-volume-name "$VOLNAME" \
-    -o "$RAW_DIR/${NAME}" "$STAGE"
-  hdiutil convert "$RAW_DIR/${NAME}.dmg" -format UDZO -o "dist/${NAME}.dmg"
+  if [ "$LAYOUT_DEPS_OK" = 0 ]; then
+    echo "提示：缺少布局依赖，生成不含 .DS_Store 的 DMG" >&2
+    build_plain_dmg
+  elif build_dmg_with_generated_layout; then
+    echo "DMG 安装界面布局完成（预生成 .DS_Store）"
+  else
+    echo "警告：背景别名不可用，退回纯色背景布局" >&2
+    .venv/bin/python packaging/dmg_layout.py "$STAGE" "书影记录.app" || true
+    build_plain_dmg
+  fi
 fi
 hdiutil verify "dist/${NAME}.dmg" >/dev/null
 

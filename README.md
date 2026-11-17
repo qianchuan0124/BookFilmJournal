@@ -129,6 +129,8 @@ packaging\build_windows.bat --portable-only
 pip install -r requirements-build.txt
 ```
 
+- `ds-store` / `mac-alias` 只在 macOS 打包时安装，用于生成 DMG 安装界面的 `.DS_Store` 布局；缺失时会跳过自定义布局继续出包，背景退化为纯色。
+
 Chrome/Edge 仅作为 PNG 内置渲染失败时的回退，不会打进安装包；Calibre 属于可选外部程序，应用内安装会从官方发布地址下载约 200–400 MB 的安装包。
 
 ## 🗂 数据存储与备份

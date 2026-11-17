@@ -1,2 +1,5 @@
 -r requirements.txt
 pyinstaller>=6.11
+# DMG 安装界面布局用到的包，只有 macOS 打包需要；Windows 打包会跳过。
+ds-store>=1.3.1; sys_platform == "darwin"
+mac-alias>=2.2.2; sys_platform == "darwin"
