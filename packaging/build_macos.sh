@@ -23,8 +23,16 @@ fi
 
 codesign --force --deep --sign - "$APP" || true
 rm -rf dist/ShuyingJilu
-NAME="ShuyingJilu-mac"
-ditto -c -k --norsrc --keepParent "$APP" "dist/${NAME}.zip"
+
+# 版本号取自 app/config.py，发布包按「书影记录-<版本>-<架构>」命名，便于内网分发。
+VERSION="$(.venv/bin/python -c 'from app.config import APP_VERSION; print(APP_VERSION)')"
+ARCH="$(uname -m)"
+NAME="书影记录-${VERSION}-${ARCH}"
+RELEASE="dist/release"
+rm -rf "$RELEASE"
+mkdir -p "$RELEASE"
+OUT_DMG="$RELEASE/${NAME}.dmg"
+ditto -c -k --norsrc --keepParent "$APP" "$RELEASE/${NAME}.zip"
 
 # DMG 安装界面：应用图标 + Applications 拖拽入口 + 背景图 + 固定窗口布局。
 # 布局需要挂载可读写卷并用 AppleScript 设置 Finder；若挂载或布局失败，
@@ -109,7 +117,7 @@ EOF
   hdiutil detach "$MOUNT_POINT" -quiet || return 1
   MOUNT_POINT=""
   hdiutil convert "$RAW_DIR/layout.sparseimage" -format UDZO \
-    -o "dist/${NAME}.dmg" -quiet || return 1
+    -o "$OUT_DMG" -quiet || return 1
 }
 
 detach_volume() {
@@ -122,8 +130,8 @@ detach_volume() {
 build_plain_dmg() {
   # 最简兜底：不含 .DS_Store，只保证产出一个可用的 DMG。
   hdiutil makehybrid -quiet -hfs -hfs-volume-name "$VOLNAME" \
-    -o "$RAW_DIR/${NAME}" "$STAGE" || return 1
-  hdiutil convert "$RAW_DIR/${NAME}.dmg" -format UDZO -o "dist/${NAME}.dmg" -quiet
+    -o "$RAW_DIR/plain" "$STAGE" || return 1
+  hdiutil convert "$RAW_DIR/plain.dmg" -format UDZO -o "$OUT_DMG" -quiet
 }
 
 build_dmg_with_generated_layout() {
@@ -154,7 +162,7 @@ build_dmg_with_generated_layout() {
     return 1
   fi
   hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
-  hdiutil convert "$RAW_DIR/rw.dmg" -format UDZO -o "dist/${NAME}.dmg" -quiet || return 1
+  hdiutil convert "$RAW_DIR/rw.dmg" -format UDZO -o "$OUT_DMG" -quiet || return 1
 }
 
 # .DS_Store 布局依赖 ds-store / mac-alias，属于可选增强：缺失时跳过自定义布局继续出包。
@@ -165,8 +173,9 @@ if ! .venv/bin/python -c "import ds_store, mac_alias" >/dev/null 2>&1; then
        "补装：.venv/bin/python -m pip install -r requirements-build.txt" >&2
 fi
 
-if build_dmg_with_layout; then
-  echo "DMG 安装界面布局完成"
+# 优先离线写入 .DS_Store：不调用 Finder，打包时不会弹出安装界面窗口。
+if [ "$LAYOUT_DEPS_OK" = 1 ] && build_dmg_with_generated_layout; then
+  echo "DMG 安装界面布局完成（离线写入，不弹 Finder 窗口）"
 else
   if [ -n "$MOUNT_POINT" ]; then
     hdiutil detach "$MOUNT_POINT" -quiet -force 2>/dev/null || true
@@ -175,15 +184,17 @@ else
   if [ "$LAYOUT_DEPS_OK" = 0 ]; then
     echo "提示：缺少布局依赖，生成不含 .DS_Store 的 DMG" >&2
     build_plain_dmg
-  elif build_dmg_with_generated_layout; then
-    echo "DMG 安装界面布局完成（预生成 .DS_Store）"
+  elif build_dmg_with_layout; then
+    echo "DMG 安装界面布局完成（Finder 排版）"
   else
     echo "警告：背景别名不可用，退回纯色背景布局" >&2
     .venv/bin/python packaging/dmg_layout.py "$STAGE" "书影记录.app" || true
     build_plain_dmg
   fi
 fi
-hdiutil verify "dist/${NAME}.dmg" >/dev/null
+hdiutil verify "$OUT_DMG" >/dev/null
 
-echo "macOS 包已生成："
-ls -lh "dist/${NAME}.zip" "dist/${NAME}.dmg"
+sed "s/__VERSION__/${VERSION}/g" packaging/安装说明.txt > "$RELEASE/书影记录-安装说明.txt"
+
+echo "内网分发包已生成（$RELEASE）："
+ls -lh "$RELEASE"
