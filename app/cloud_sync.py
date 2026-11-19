@@ -27,10 +27,14 @@ SNAPSHOT_PREFIX = 'douban_trace_'
 SNAPSHOT_SUFFIX = '.db'
 ICLOUD_STUB_SUFFIX = f'{SNAPSHOT_SUFFIX}.icloud'
 MANIFEST_NAME = 'latest.json'
-SNAPSHOT_KEEP_PER_DEVICE = 3
+# 每台设备分别保留：自动备份最近 3 份、手动备份最近 2 份，互不影响。
+SNAPSHOT_KEEP_AUTO = 3
+SNAPSHOT_KEEP_MANUAL = 2
+KIND_AUTO = 'auto'
+KIND_MANUAL = 'manual'
 SNAPSHOT_NAME_RE = re.compile(
-    rf'^{re.escape(SNAPSHOT_PREFIX)}(\d{{8}}_\d{{6}})_([0-9a-f]{{4}})(?:_\d+)?'
-    rf'{re.escape(SNAPSHOT_SUFFIX)}$'
+    rf'^{re.escape(SNAPSHOT_PREFIX)}(\d{{8}}_\d{{6}})_([0-9a-f]{{4}})'
+    rf'(?:_({KIND_AUTO}|{KIND_MANUAL}))?(?:_\d+)?{re.escape(SNAPSHOT_SUFFIX)}$'
 )
 LOCAL_BACKUP_KEEP = 5
 
@@ -47,6 +51,8 @@ LOCAL_SETTING_KEYS = (
     'cloud_sync_last_state',
     'cloud_sync_last_time',
     'cloud_sync_last_snapshot',
+    'cloud_sync_auto_backup',
+    'cloud_sync_auto_sync',
 )
 PRESERVE_ON_RESTORE = ('douban_cookie', 'book_library_dir', 'cloud_sync_dir')
 
@@ -54,6 +60,8 @@ SETTING_DIR = 'cloud_sync_dir'
 SETTING_LAST_STATE = 'cloud_sync_last_state'
 SETTING_LAST_TIME = 'cloud_sync_last_time'
 SETTING_LAST_SNAPSHOT = 'cloud_sync_last_snapshot'
+SETTING_AUTO_BACKUP = 'cloud_sync_auto_backup'
+SETTING_AUTO_SYNC = 'cloud_sync_auto_sync'
 
 
 class SyncError(Exception):
@@ -167,6 +175,19 @@ def _counts(conn: sqlite3.Connection) -> dict[str, int]:
     return result
 
 
+def _media_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """记录按影视/书籍拆分，便于对比快照与本机的数据构成。"""
+    result = {'movie': 0, 'book': 0}
+    try:
+        for media_type, value in conn.execute(
+                "SELECT media_type, COUNT(*) FROM records GROUP BY media_type"):
+            if media_type in result:
+                result[media_type] = int(value or 0)
+    except sqlite3.Error:
+        pass
+    return result
+
+
 def _records_updated(conn: sqlite3.Connection) -> str:
     try:
         return str(conn.execute(
@@ -201,11 +222,12 @@ def _snapshot_info(name: str) -> Optional[dict]:
     if not match:
         return None
     stamp, tag = match.group(1), match.group(2)
+    kind = match.group(3) or KIND_MANUAL  # 旧版快照没有类型标记，按手动备份处理
     try:
         created = datetime.strptime(stamp, '%Y%m%d_%H%M%S')
     except ValueError:
         return None
-    return {'snapshot': name, 'tag': tag, 'created': created}
+    return {'snapshot': name, 'tag': tag, 'kind': kind, 'created': created}
 
 
 def _iter_snapshot_files(folder: Path):
@@ -220,15 +242,16 @@ def _iter_snapshot_files(folder: Path):
 
 
 def _prune_snapshots(folder: Path) -> None:
-    """每台设备只保留最新的若干份快照，避免同步目录无限增长。"""
-    groups: dict[str, list[str]] = {}
+    """每台设备的自动/手动快照分别只保留最近几份，避免同步目录无限增长。"""
+    groups: dict[tuple, list[str]] = {}
     for name, _path, _stub in _iter_snapshot_files(folder):
         info = _snapshot_info(name)
         if info:
-            groups.setdefault(info['tag'], []).append(name)
-    for names in groups.values():
+            groups.setdefault((info['tag'], info['kind']), []).append(name)
+    for (tag, kind), names in groups.items():
+        keep = SNAPSHOT_KEEP_AUTO if kind == KIND_AUTO else SNAPSHOT_KEEP_MANUAL
         names.sort(reverse=True)
-        for name in names[SNAPSHOT_KEEP_PER_DEVICE:]:
+        for name in names[keep:]:
             try:
                 (folder / name).unlink()
             except OSError:
@@ -273,6 +296,9 @@ def list_snapshots(folder: Optional[Path]) -> list[dict]:
                 conn = _open_snapshot(path)
                 try:
                     counts = _counts(conn)
+                    media = _media_counts(conn)
+                    counts['records_movie'] = media['movie']
+                    counts['records_book'] = media['book']
                     records_updated = _records_updated(conn)
                 finally:
                     conn.close()
@@ -281,6 +307,7 @@ def list_snapshots(folder: Optional[Path]) -> list[dict]:
         items.append({
             'snapshot': name,
             'tag': info['tag'],
+            'kind': info['kind'],
             'created_at': created_at,
             'created_ts': int(info['created'].timestamp()),
             'device': device,
@@ -298,19 +325,24 @@ def list_snapshots(folder: Optional[Path]) -> list[dict]:
     return items
 
 
-def _unique_snapshot_name(folder: Path) -> str:
+def _unique_snapshot_name(folder: Path, kind: str = KIND_MANUAL) -> str:
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     tag = _device_tag()
-    name = f'{SNAPSHOT_PREFIX}{stamp}_{tag}{SNAPSHOT_SUFFIX}'
+    name = f'{SNAPSHOT_PREFIX}{stamp}_{tag}_{kind}{SNAPSHOT_SUFFIX}'
     index = 2
     while (folder / name).exists():
-        name = f'{SNAPSHOT_PREFIX}{stamp}_{tag}_{index}{SNAPSHOT_SUFFIX}'
+        name = f'{SNAPSHOT_PREFIX}{stamp}_{tag}_{kind}_{index}{SNAPSHOT_SUFFIX}'
         index += 1
     return name
 
 
-def create_snapshot(db, force: bool = False) -> dict:
-    """把当前数据库写成一致性快照。内容没变且已有快照时直接跳过。"""
+def create_snapshot(db, force: bool = False, kind: str = KIND_MANUAL) -> dict:
+    """把当前数据库写成一致性快照。内容没变且已有快照时直接跳过。
+
+    kind 区分「自动备份」（auto）与用户点击生成的手动备份（manual），
+    两者各自计数、各自保留，互不覆盖。
+    """
+    kind = kind if kind in (KIND_AUTO, KIND_MANUAL) else KIND_MANUAL
     folder = sync_folder(db, create=True)
     if folder is None:
         raise SyncError('没有可用的同步目录，请先在设置中开启 iCloud 云盘或选择目录。')
@@ -327,7 +359,7 @@ def create_snapshot(db, force: bool = False) -> dict:
                 'counts': latest.get('counts', {}),
             }
 
-    name = _unique_snapshot_name(folder)
+    name = _unique_snapshot_name(folder, kind)
     final = folder / name
     temp = folder / f'.{name}.part'
     source = sqlite3.connect(str(db.path))
@@ -340,6 +372,9 @@ def create_snapshot(db, force: bool = False) -> dict:
         )
         target.commit()
         counts = _counts(target)
+        media = _media_counts(target)
+        counts['records_movie'] = media['movie']
+        counts['records_book'] = media['book']
         last_updated = _records_updated(target)
     finally:
         target.close()
@@ -362,6 +397,7 @@ def create_snapshot(db, force: bool = False) -> dict:
         'size': final.stat().st_size,
         'counts': counts,
         'records_updated': last_updated,
+        'kind': kind,
     }
     _write_manifest(folder, manifest)
     _prune_snapshots(folder)
@@ -492,3 +528,70 @@ def restore_snapshot(db, manifest: Optional[dict] = None) -> dict:
         'counts': info['counts'],
         'local_backup': str(local_backup),
     }
+
+
+def db_overview(db) -> dict:
+    """本机当前库的概览，用于和快照做对比展示。"""
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            counts = _counts(conn)
+            media = _media_counts(conn)
+            counts['records_movie'] = media['movie']
+            counts['records_book'] = media['book']
+            return {'counts': counts, 'records_updated': _records_updated(conn)}
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {'counts': {}, 'records_updated': ''}
+
+
+def _db_empty(db) -> bool:
+    """本地库是否还没有任何业务数据（新设备首次启动）。"""
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            for table in ('records', 'doulists', 'plan_items'):
+                if conn.execute(f'SELECT 1 FROM {table} LIMIT 1').fetchone():
+                    return False
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return False
+    return True
+
+
+def auto_backup(db) -> Optional[dict]:
+    """勾选「自动备份」时生成自动快照；未开启、内容没变或目录不可用时静默跳过。"""
+    if db.get_setting(SETTING_AUTO_BACKUP) != '1':
+        return None
+    try:
+        return create_snapshot(db, kind=KIND_AUTO)
+    except SyncError:
+        return None
+
+
+def auto_restore(db) -> Optional[dict]:
+    """勾选「自动同步」时从最新快照恢复。
+
+    只有本机没有未备份的改动（或本地还是空库）时才自动恢复，避免覆盖本地编辑。
+    """
+    if db.get_setting(SETTING_AUTO_SYNC) != '1':
+        return None
+    folder = sync_folder(db)
+    if folder is None or not folder.is_dir():
+        return None
+    manifest = load_manifest(folder)
+    if not manifest:
+        return None
+    if not (folder / manifest['snapshot']).is_file():
+        return None
+    if manifest.get('snapshot') == db.get_setting(SETTING_LAST_SNAPSHOT):
+        return None
+    local_state = state_id(db.path)
+    if local_state != (db.get_setting(SETTING_LAST_STATE) or '') and not _db_empty(db):
+        return None
+    try:
+        return restore_snapshot(db, manifest)
+    except SyncError:
+        return None

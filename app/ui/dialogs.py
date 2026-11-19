@@ -1762,6 +1762,8 @@ class TwoLineSnapshotDelegate(IndicatorMenuItemDelegate):
 
         # 第二行：数据概况（小字），用主文字色的半透明版本，保证两种主题下都清晰
         summary = SnapshotPickerDialog._brief_counts(snapshot) if snapshot else ''
+        age = SnapshotPickerDialog._age_text(snapshot) if snapshot else ''
+        summary = ' · '.join(part for part in (summary, age) if part)
         if summary:
             painter.setFont(getFont(11))
             sub_color = QColor(text_color)
@@ -1836,16 +1838,18 @@ class SnapshotComboBox(ComboBox):
 class SnapshotPickerDialog(MessageBoxBase):
     """列出同步目录中的快照，让用户自己选择要从哪一份恢复。"""
 
-    def __init__(self, snapshots: list[dict], warning: str = '', parent=None):
+    def __init__(self, snapshots: list[dict], warning: str = '', local: dict = None,
+                 parent=None):
         super().__init__(parent)
         self.snapshots = snapshots
-        self.widget.setFixedWidth(560)
+        self.local = local or {}
+        self.widget.setFixedWidth(600)
         self.yesButton.setText('恢复此备份')
         self.cancelButton.setText('取消')
         self.viewLayout.setSpacing(10)
         self.viewLayout.addWidget(SubtitleLabel('从同步目录恢复', self))
         hint = CaptionLabel(
-            '每台设备最多保留 3 份快照。恢复会用所选快照覆盖本机数据库，'
+            '每台设备保留 3 份自动备份 + 2 份手动备份。恢复会用所选快照覆盖本机数据库，'
             '覆盖前会把当前数据库自动备份到 data/backups。',
             self,
         )
@@ -1882,7 +1886,11 @@ class SnapshotPickerDialog(MessageBoxBase):
             if not snapshot.get('downloaded', True):
                 return '未下载'
             return ''
-        parts = [f"{counts.get('records', 0)}条记录"]
+        movie, book = counts.get('records_movie'), counts.get('records_book')
+        if movie is not None and book is not None:
+            parts = [f"影视 {movie} · 读书 {book}"]
+        else:
+            parts = [f"{counts.get('records', 0)}条记录"]
         doulists = counts.get('doulists', 0)
         if doulists:
             parts.append(f"{doulists}个豆列")
@@ -1896,11 +1904,34 @@ class SnapshotPickerDialog(MessageBoxBase):
 
     @staticmethod
     def _label(snapshot: dict) -> str:
-        """下拉项第一行：时间 · 设备（最新标记）。数据概况由委托另起一行小字绘制。"""
+        """下拉项第一行：时间 · 类型 · 设备（最新标记）。数据概况由委托另起一行小字绘制。"""
         created = snapshot.get('created_at') or '未知时间'
         device = snapshot.get('device') or '未知设备'
+        kind = '自动' if snapshot.get('kind') == 'auto' else '手动'
         marker = '（最新）' if snapshot.get('is_latest') else ''
-        return f'{created} · {device}{marker}'
+        return f'{created} · {kind} · {device}{marker}'
+
+    @staticmethod
+    def _fmt_time(value: str) -> str:
+        """把 ISO 时间（2026-11-19T10:20:00）显示成易读的分钟精度。"""
+        return (value or '').replace('T', ' ')[:16]
+
+    @staticmethod
+    def _age_text(snapshot: dict) -> str:
+        """快照距今多久，帮助判断新旧（时间取自文件名/清单）。"""
+        created_ts = snapshot.get('created_ts') or 0
+        if not created_ts:
+            return ''
+        diff = int(time.time() - created_ts)
+        if diff < 0:
+            return ''
+        if diff < 60:
+            return '刚刚'
+        if diff < 3600:
+            return f'{diff // 60} 分钟前'
+        if diff < 86400:
+            return f'{diff // 3600} 小时前'
+        return f'{diff // 86400} 天前'
 
     @staticmethod
     def _size_text(size: int) -> str:
@@ -1917,7 +1948,12 @@ class SnapshotPickerDialog(MessageBoxBase):
         lines: list[str] = []
         counts = item.get('counts')
         if isinstance(counts, dict):
-            data_parts = [f"{counts.get('records', 0)} 条记录"]
+            movie, book = counts.get('records_movie'), counts.get('records_book')
+            if movie is not None and book is not None:
+                data_parts = [f"影视 {movie} 条 · 读书 {book} 条"
+                              f"（共 {counts.get('records', 0)} 条）"]
+            else:
+                data_parts = [f"{counts.get('records', 0)} 条记录"]
             doulists = counts.get('doulists', 0)
             doulist_items = counts.get('doulist_items', 0)
             if doulists or doulist_items:
@@ -1934,10 +1970,14 @@ class SnapshotPickerDialog(MessageBoxBase):
                 data_parts.append(f"{book_meta} 条书籍元数据")
             updated = item.get('records_updated') or ''
             if updated:
-                data_parts.append(f"最近更新 {updated[:16]}")
+                data_parts.append(f"最近更新 {self._fmt_time(updated)}")
             lines.append('数据：' + ' · '.join(data_parts))
         elif not item.get('downloaded', True):
             lines.append('数据：尚未下载到本机，恢复时可能要先等待同步')
+
+        compare = self._compare_line(item)
+        if compare:
+            lines.append(compare)
 
         meta_parts = [f"文件 {item.get('snapshot', '')}"]
         if item.get('downloaded', True):
@@ -1949,8 +1989,39 @@ class SnapshotPickerDialog(MessageBoxBase):
             meta_parts.append(f'由 v{version} 创建')
             if version != APP_VERSION:
                 meta_parts.append(f'与当前 {APP_VERSION_TEXT} 不同，可能不完全兼容')
+        if item.get('snapshot') and item.get('snapshot') == (self.local or {}).get('last_snapshot'):
+            meta_parts.append('本机上次备份')
+        meta_parts.append('校验值已核对' if item.get('sha256') else '旧快照（无校验值）')
         lines.append(' · '.join(meta_parts))
+        lines.append('提示：封面图片不随快照同步，恢复后可按提示从豆瓣补全。')
         self.detail.setText('\n'.join(lines))
+
+    def _compare_line(self, item: dict) -> str:
+        """把快照和本机当前数据做规模对比，直观判断哪份更完整/更新。"""
+        local_counts = (self.local or {}).get('counts') or {}
+        snapshot_counts = item.get('counts')
+        if not isinstance(local_counts, dict) or not isinstance(snapshot_counts, dict):
+            return ''
+        if not local_counts or not snapshot_counts:
+            return ''
+        if 'records_movie' in snapshot_counts and 'records_book' in snapshot_counts:
+            labels = (('records_movie', '影视'), ('records_book', '读书'),
+                      ('doulists', '豆列'), ('plan_items', '计划'))
+        else:
+            labels = (('records', '记录'), ('doulists', '豆列'), ('plan_items', '计划'))
+        parts = []
+        for key, label in labels:
+            diff = int(snapshot_counts.get(key, 0)) - int(local_counts.get(key, 0))
+            if diff:
+                parts.append(f'{label} {"+" if diff > 0 else ""}{diff}')
+        text = '与本机相同' if not parts else '与本机相比：' + '、'.join(parts)
+        snapshot_updated = self._fmt_time(item.get('records_updated') or '')
+        local_updated = self._fmt_time((self.local or {}).get('records_updated') or '')
+        if snapshot_updated and local_updated:
+            text += f'；最近更新 {snapshot_updated}（本机 {local_updated}）'
+        elif snapshot_updated:
+            text += f'；最近更新 {snapshot_updated}'
+        return text
 
 
 class CalibreInstallDialog(MessageBoxBase):

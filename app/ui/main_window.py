@@ -1,9 +1,12 @@
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from qfluentwidgets import (
-    CaptionLabel, FluentIcon, FluentWindow, NavigationItemPosition, qconfig,
+    CaptionLabel, FluentIcon, FluentWindow, InfoBar, InfoBarPosition,
+    NavigationItemPosition, qconfig,
 )
 
+from app.cloud_sync import auto_backup, auto_restore
 from app.config import APP_VERSION_TEXT
 from app.db import Database
 from app.ui.records_page import RecordsPage
@@ -60,14 +63,57 @@ class MainWindow(FluentWindow):
 
         qconfig.themeChangedFinished.connect(self._on_theme_changed)
 
+        # 自动备份：数据变动后合并成一次，延迟生成自动快照（手动备份不受影响）。
+        self._auto_backup_timer = QTimer(self)
+        self._auto_backup_timer.setSingleShot(True)
+        self._auto_backup_timer.timeout.connect(self._run_auto_backup)
+
         screen = QApplication.primaryScreen().availableGeometry()
         self.move(screen.center() - self.rect().center())
+        # 启动后稍等界面就绪，再尝试自动同步云端最新快照。
+        QTimer.singleShot(1800, self._run_auto_sync)
 
     def _on_theme_changed(self) -> None:
         self.movie_page.apply_theme()
         self.book_page.apply_theme()
 
+    def _schedule_auto_backup(self, delay: int = 30000) -> None:
+        if self.db.get_setting('cloud_sync_auto_backup') != '1':
+            return
+        self._auto_backup_timer.start(delay)
+
+    def _run_auto_backup(self) -> None:
+        result = auto_backup(self.db)
+        if result and not result.get('skipped'):
+            self.data_page.refresh_sync()
+
+    def _run_auto_sync(self) -> None:
+        result = auto_restore(self.db)
+        if not result:
+            return
+        counts = result.get('counts') or {}
+        self.movie_page.mark_dirty()
+        self.book_page.mark_dirty()
+        self.doulist_page.mark_dirty()
+        self.plan_page.mark_dirty()
+        self.report_page.mark_dirty()
+        self.data_page.mark_dirty()
+        self.data_page.refresh_sync()
+        InfoBar.success(
+            '已自动同步云端数据',
+            f"启动时检测到更新的快照，已恢复 {counts.get('records', 0)} 条记录。",
+            parent=self, position=InfoBarPosition.TOP_RIGHT, duration=8000,
+        )
+
+    def closeEvent(self, event) -> None:
+        # 退出前落一次自动备份，避免刚改完就退出导致云端落后。
+        if self.db.get_setting('cloud_sync_auto_backup') == '1':
+            self._auto_backup_timer.stop()
+            auto_backup(self.db)
+        super().closeEvent(event)
+
     def _on_synced(self, result: dict) -> None:
+        self._schedule_auto_backup(delay=5000)
         self.movie_page.mark_dirty()
         self.book_page.mark_dirty()
         self.doulist_page.mark_dirty()
@@ -76,6 +122,7 @@ class MainWindow(FluentWindow):
         self.report_page.mark_dirty()
 
     def _on_records_changed(self, media_type: str = '') -> None:
+        self._schedule_auto_backup()
         # 记录页在改动后已自行刷新；指定类型时另一类型页面不受影响，无需重建。
         if not media_type:
             self.movie_page.mark_dirty()

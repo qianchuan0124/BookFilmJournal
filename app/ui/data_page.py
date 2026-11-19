@@ -35,12 +35,15 @@ from qfluentwidgets import (
 )
 
 from app.cloud_sync import (
+    SETTING_AUTO_BACKUP,
+    SETTING_AUTO_SYNC,
     SYNC_SUBDIR,
     SyncError,
+    auto_restore,
+    db_overview,
     base_dir,
     check_sync,
     create_snapshot,
-    detected_dirs,
     list_snapshots,
     restore_snapshot,
 )
@@ -269,10 +272,8 @@ class DataPage(QWidget):
         sync_layout.setSpacing(10)
         sync_layout.addWidget(BodyLabel('云同步（iCloud / OneDrive）', sync_card))
         sync_hint = CaptionLabel(
-            '应用内不支持登录 iCloud：请先在系统设置登录并开启 iCloud 云盘，'
-            'Windows 需安装 iCloud for Windows。备份与恢复都需要手动点击按钮触发，'
-            '应用不会自动上传或覆盖数据。快照不包含登录 Cookie；'
-            '封面图片仍保存在本机，换设备后可重新补全；书籍页数已随快照同步。',
+            '需先在系统设置开启 iCloud 云盘（Windows 装 iCloud for Windows）。'
+            '快照不含登录 Cookie 和封面图片，封面可在新设备上补全。',
             sync_card,)
         sync_hint.setWordWrap(True)
         sync_hint.setTextColor('#5f6b7a', '#8d95a5')
@@ -281,6 +282,38 @@ class DataPage(QWidget):
         self.sync_status.setWordWrap(True)
         self.sync_status.setTextColor('#5f6b7a', '#8d95a5')
         sync_layout.addWidget(self.sync_status)
+
+        auto_row = QHBoxLayout()
+        auto_row.setSpacing(10)
+        self.auto_backup_switch = SwitchButton(sync_card)
+        self.auto_backup_switch.setOnText('开')
+        self.auto_backup_switch.setOffText('关')
+        self.auto_backup_switch.checkedChanged.connect(self._on_auto_backup_changed)
+        auto_row.addWidget(self.auto_backup_switch)
+        auto_label = CaptionLabel(
+            '自动备份：数据变动后自动生成快照，每台设备保留最近 3 份自动 + 2 份手动备份',
+            sync_card)
+        auto_label.setWordWrap(True)
+        auto_label.setTextColor('#5f6b7a', '#8d95a5')
+        auto_row.addWidget(auto_label, 1)
+        sync_layout.addLayout(auto_row)
+
+        sync_auto_row = QHBoxLayout()
+        sync_auto_row.setSpacing(10)
+        self.auto_sync_switch = SwitchButton(sync_card)
+        self.auto_sync_switch.setOnText('开')
+        self.auto_sync_switch.setOffText('关')
+        self.auto_sync_switch.checkedChanged.connect(self._on_auto_sync_changed)
+        sync_auto_row.addWidget(self.auto_sync_switch)
+        auto_sync_label = CaptionLabel(
+            '自动同步：启动时如果云端有更新的快照、且本机没有未备份的改动，'
+            '自动恢复最新的数据',
+            sync_card)
+        auto_sync_label.setWordWrap(True)
+        auto_sync_label.setTextColor('#5f6b7a', '#8d95a5')
+        sync_auto_row.addWidget(auto_sync_label, 1)
+        sync_layout.addLayout(sync_auto_row)
+
         sync_row = QHBoxLayout()
         sync_row.setSpacing(10)
         self.sync_dir_button = PushButton(FluentIcon.FOLDER, '选择同步目录', sync_card)
@@ -294,6 +327,12 @@ class DataPage(QWidget):
         sync_row.addWidget(self.sync_restore_button)
         sync_row.addStretch(1)
         sync_layout.addLayout(sync_row)
+
+        for switch, key in ((self.auto_backup_switch, SETTING_AUTO_BACKUP),
+                            (self.auto_sync_switch, SETTING_AUTO_SYNC)):
+            switch.blockSignals(True)
+            switch.setChecked(self.db.get_setting(key) == '1')
+            switch.blockSignals(False)
         layout.addWidget(sync_card)
 
         word_card = CardWidget(self)
@@ -709,31 +748,48 @@ class DataPage(QWidget):
         if root is None:
             lines.append('未检测到 iCloud 云盘或 OneDrive，请选择同步目录。')
         elif not root.is_dir():
-            lines.append(f'同步目录不可用：{root}，请重新选择。')
-        else:
-            folder = root / SYNC_SUBDIR
-            suffix = '' if folder.is_dir() else '（尚未创建）'
-            candidates = detected_dirs()
-            source = ''
-            if not (self.db.get_setting('cloud_sync_dir') or '').strip() and candidates:
-                source = f'（自动识别为{candidates[0][0]}）'
-            lines.append(f'同步目录：{folder}{suffix}{source}')
+            lines.append('同步目录不可用，请重新选择。')
+        local = db_overview(self.db)
+        local_counts = local.get('counts') or {}
         manifest = info.get('manifest')
         if manifest:
             if info.get('missing'):
                 lines.append(f'最新快照 {manifest.get("snapshot")} 尚未下载完成。')
             else:
                 counts = manifest.get('counts') or {}
+                movie, book = counts.get('records_movie'), counts.get('records_book')
+                if movie is not None and book is not None:
+                    records_text = f'影视 {movie} · 读书 {book}'
+                    local_movie = local_counts.get('records_movie', 0)
+                    local_book = local_counts.get('records_book', 0)
+                    deltas = []
+                    if movie - local_movie:
+                        deltas.append(f'影视 {"+" if movie > local_movie else ""}{movie - local_movie}')
+                    if book - local_book:
+                        deltas.append(f'读书 {"+" if book > local_book else ""}{book - local_book}')
+                    compared = ('（' + '、'.join(deltas) + '）') if deltas else '（与本机相同）'
+                else:
+                    diff = int(counts.get('records', 0)) - int(local_counts.get('records', 0))
+                    if diff > 0:
+                        compared = f'（较本机多 {diff} 条记录）'
+                    elif diff < 0:
+                        compared = f'（较本机少 {-diff} 条记录）'
+                    else:
+                        compared = '（记录数与本机相同）'
+                    records_text = f'记录 {counts.get("records", 0)} 条'
                 lines.append(
                     f'最近备份：{manifest.get("created_at", "未知时间")}'
                     f' · {manifest.get("device", "未知设备")}'
-                    f' · 记录 {counts.get("records", 0)} 条'
-                    f' · 计划 {counts.get("plan_items", 0)} 条'
+                    f' · {records_text}{compared}'
                 )
         elif info['folder'] and Path(info['folder']).is_dir():
             lines.append('同步目录里还没有备份，点击「立即备份」创建第一份。')
         if manifest and info.get('dirty'):
             lines.append('本地有尚未备份的改动。')
+        auto_backup = self.db.get_setting(SETTING_AUTO_BACKUP) == '1'
+        auto_sync = self.db.get_setting(SETTING_AUTO_SYNC) == '1'
+        lines.append('自动备份：%s · 自动同步：%s' % ('开' if auto_backup else '关',
+                                             '开' if auto_sync else '关'))
         self.sync_status.setText('\n'.join(lines))
 
     def choose_sync_dir(self) -> None:
@@ -758,12 +814,39 @@ class DataPage(QWidget):
             parent=self, position=InfoBarPosition.TOP, duration=5000,
         )
 
+    def _on_auto_backup_changed(self, checked: bool) -> None:
+        self.db.set_setting(SETTING_AUTO_BACKUP, '1' if checked else '0')
+        self.refresh_sync()
+
+    def _on_auto_sync_changed(self, checked: bool) -> None:
+        self.db.set_setting(SETTING_AUTO_SYNC, '1' if checked else '0')
+        if checked:
+            self.try_auto_sync()
+        self.refresh_sync()
+
+    def try_auto_sync(self) -> None:
+        """立即尝试一次自动同步；只有本机没有未备份改动时才会真正恢复。"""
+        try:
+            result = auto_restore(self.db)
+        except Exception:
+            return
+        if not result:
+            return
+        self.refresh()
+        self.records_changed.emit()
+        counts = result.get('counts') or {}
+        InfoBar.success(
+            '已自动同步',
+            f"已从云端最新快照恢复 {counts.get('records', 0)} 条记录。",
+            parent=self, position=InfoBarPosition.TOP, duration=6000,
+        )
+
     def backup_to_sync(self) -> None:
         try:
             # 备份前把本机缓存里的历史页数补进数据库；只有用户点备份时才做，
             # 避免把本地可能过时的数据悄悄写进库并上传。
             sync_book_pages(self.db, import_local=True)
-            result = create_snapshot(self.db)
+            result = create_snapshot(self.db, kind='manual')
         except SyncError as exc:
             InfoBar.error('备份失败', str(exc), parent=self,
                           position=InfoBarPosition.TOP, duration=6000)
@@ -813,7 +896,9 @@ class DataPage(QWidget):
         warning = ''
         if info.get('dirty'):
             warning = '注意：本地有尚未备份的改动，恢复后这些改动将丢失。'
-        picker = SnapshotPickerDialog(snapshots, warning, self.window())
+        local = db_overview(self.db)
+        local['last_snapshot'] = self.db.get_setting('cloud_sync_last_snapshot')
+        picker = SnapshotPickerDialog(snapshots, warning, local, self.window())
         if not picker.exec():
             return
         manifest = picker.selected_snapshot()
