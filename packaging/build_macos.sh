@@ -196,5 +196,5 @@ hdiutil verify "$OUT_DMG" >/dev/null
 
 sed "s/__VERSION__/${VERSION}/g" packaging/安装说明.txt > "$RELEASE/书影记录-安装说明.txt"
 
-echo "内网分发包已生成（$RELEASE）："
+echo "内网分发包已生成（${RELEASE}）："
 ls -lh "$RELEASE"
