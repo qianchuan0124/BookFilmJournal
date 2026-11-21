@@ -31,7 +31,7 @@ BOOK_META_CACHE = CACHE_DIR / 'book_meta.json'
 MOVIE_META_CACHE = CACHE_DIR / 'movie_meta.json'
 BOOK_WORDS_CACHE = CACHE_DIR / 'book_words.json'
 
-APP_VERSION = '0.1.0'
+APP_VERSION = '0.1.1'
 APP_VERSION_TEXT = f'v{APP_VERSION}'
 
 MEDIA_LABELS = {'movie': '观影', 'book': '读书'}
