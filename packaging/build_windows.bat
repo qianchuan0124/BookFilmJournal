@@ -1,4 +1,6 @@
 @echo off
+rem 本脚本以 UTF-8 保存，中文提示需要 65001 才能正常显示（默认 936 下会乱码）
+chcp 65001 >nul
 setlocal
 cd /d "%~dp0\.."
 
@@ -15,10 +17,14 @@ if not exist ".venv\Scripts\python.exe" (
     py -3 -m venv .venv
   )
 )
-".venv\Scripts\python.exe" -m pip install --upgrade pip
-if errorlevel 1 exit /b 1
-".venv\Scripts\python.exe" -m pip install -r requirements-build.txt
-if errorlevel 1 exit /b 1
+rem 依赖已装齐时完全离线：先按本地已装版本校验，缺失或版本不符才联网安装。
+rem 不做 pip 自升级——代理不稳时会长时间空转卡住，而它对打包没有实际作用。
+".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --no-index --quiet -r requirements-build.txt >nul 2>&1
+if errorlevel 1 (
+  echo 正在安装打包依赖，首次运行需要联网，请耐心等待...
+  ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --timeout 30 --retries 2 -r requirements-build.txt
+  if errorlevel 1 exit /b 1
+)
 if exist "dist\ShuyingJilu" rmdir /s /q "dist\ShuyingJilu"
 del /f /q "dist\*.zip" 2>nul
 
@@ -57,9 +63,16 @@ if not defined ISCC (
   exit /b 1
 )
 
-for /f "usebackq delims=" %%v in (`".venv\Scripts\python.exe" -c "import sys;sys.path.insert(0,'.');from app.config import APP_VERSION;print(APP_VERSION)"`) do set "APP_VERSION=%%v"
+rem 版本号走临时文件：for /f 里嵌套引号会被 cmd 的错误引号规则吞掉，导致读到空版本
+set "APP_VERSION="
+".venv\Scripts\python.exe" -c "import sys;sys.path.insert(0,'.');from app.config import APP_VERSION;print(APP_VERSION)" > "%TEMP%\bfj_version.txt" 2>nul
+if exist "%TEMP%\bfj_version.txt" set /p APP_VERSION=<"%TEMP%\bfj_version.txt"
+del /f /q "%TEMP%\bfj_version.txt" 2>nul
+set "VER_ARG="
+if defined APP_VERSION set "VER_ARG=/DMyAppVersion=%APP_VERSION%"
+if not defined VER_ARG echo 未读取到应用版本号，安装包将使用 ShuyingJilu.iss 里的默认值。
 
-"%ISCC%" /DMyAppVersion=%APP_VERSION% packaging\ShuyingJilu.iss
+"%ISCC%" %VER_ARG% packaging\ShuyingJilu.iss
 if errorlevel 1 exit /b 1
 
 if not exist "dist\ShuyingJilu-win.setup.exe" (

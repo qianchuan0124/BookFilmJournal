@@ -7,8 +7,12 @@ PYTHON="${PYTHON:-python3}"
 if [ ! -x .venv/bin/python ]; then
   "$PYTHON" -m venv .venv
 fi
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/python -m pip install -r requirements-build.txt
+# 依赖已装齐时完全离线：先按本地已装版本校验，缺失或版本不符才联网安装。
+# 不做 pip 自升级——代理不稳时会长时间卡住，而它对打包没有实际作用。
+if ! .venv/bin/python -m pip install --disable-pip-version-check --no-index --quiet -r requirements-build.txt >/dev/null 2>&1; then
+  echo "正在安装打包依赖，首次运行需要联网，请耐心等待..."
+  .venv/bin/python -m pip install --disable-pip-version-check --timeout 30 --retries 2 -r requirements-build.txt
+fi
 
 rm -rf "dist/书影记录.app" dist/ShuyingJilu
 rm -f dist/*.zip dist/*.dmg
