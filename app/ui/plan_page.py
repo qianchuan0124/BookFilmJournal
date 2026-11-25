@@ -239,7 +239,10 @@ class PlanRow(QFrame):
 
         index = CaptionLabel(f'{position:02d}', self)
         index.setFixedWidth(28)
-        index.setStyleSheet('color:#e5b45f; font-weight:700;')
+        bold = index.font()
+        bold.setBold(True)
+        index.setFont(bold)
+        index.setTextColor('#b07c20', '#e5b45f')
         layout.addWidget(index, 0, Qt.AlignVCenter)
 
         cover = QLabel(self)
@@ -270,7 +273,7 @@ class PlanRow(QFrame):
         if item['note']:
             note = CaptionLabel('', self)
             note.setText(metrics.elidedText(item['note'], Qt.ElideRight, 620))
-            note.setStyleSheet('color:#c9c5bb;')
+            note.setTextColor('#7a7466', '#c9c5bb')
             info.addWidget(note)
         info.addStretch(1)
 
@@ -371,12 +374,13 @@ class PlanCandidateRow(QWidget):
             matched.setTextFormat(Qt.RichText)
             matched.setText('简介：' + snippet)
             matched.setContentsMargins(36, 0, 0, 0)
-            matched.setStyleSheet('color:#8d95a5;')
+            matched.setTextColor('#5f6b7a', '#8d95a5')
             layout.addWidget(matched)
         if hint_text:
             hint = CaptionLabel(hint_text, self)
             hint.setContentsMargins(36, 0, 0, 0)
-            hint.setStyleSheet('color:#b98900;' if locked else 'color:#8d95a5;')
+            hint.setTextColor('#8d6a00', '#b98900') if locked else \
+                hint.setTextColor('#5f6b7a', '#8d95a5')
             layout.addWidget(hint)
 
     def _on_state(self, state) -> None:

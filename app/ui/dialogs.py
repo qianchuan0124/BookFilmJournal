@@ -4,15 +4,16 @@ import sqlite3
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QModelIndex, QPoint, QRectF, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QDate, QModelIndex, QPoint, QRectF, QSize, QThread, Qt, QUrl, Signal
 from PySide6.QtGui import QAction, QColor, QDesktopServices, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QScrollArea,
-    QSizePolicy, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QApplication, QFileDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QScrollArea, QSizePolicy, QStyle, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 from qfluentwidgets import (
-    Action, BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon, InfoBar, InfoBarPosition,
+    Action, BodyLabel, CaptionLabel, CheckBox, ComboBox, FluentIcon,
+    InfoBar, InfoBarPosition,
     IndicatorMenuItemDelegate, LineEdit, MenuAnimationType, RoundMenu,
     IndeterminateProgressRing, MessageBoxBase, ProgressBar, PushButton,
     StrongBodyLabel, SubtitleLabel,
@@ -22,6 +23,7 @@ from qfluentwidgets.components.widgets.combo_box import ComboBoxMenu
 from qfluentwidgets.common.font import getFont
 from qfluentwidgets.common.style_sheet import themeColor
 
+from app import explore
 from app.calibre_install import install_calibre
 from app.config import (
     APP_VERSION, APP_VERSION_TEXT, COVERS_DIR, DB_PATH, MEDIA_LABELS, READ_LABELS, ROOT,
@@ -30,6 +32,7 @@ from app.db import Database
 from app.douban import (
     extract_user_id_from_cookie, fetch_cover, fetch_subject_detail, sync_to_db,
 )
+from app.cover_sync import is_custom_cover
 from app.media_meta import (
     book_pages, book_stats_text, manual_movie_duration, movie_duration,
     movie_stats_text, parse_duration, set_book_pages, set_movie_duration,
@@ -267,7 +270,7 @@ class EditRecordDialog(MessageBoxBase):
             word_row.setSpacing(8)
             word_row.addWidget(self.word_edit)
             self.word_hint = CaptionLabel('', self)
-            self.word_hint.setStyleSheet('color:#e5b45f;')
+            self.word_hint.setTextColor('#b07c20', '#e5b45f')
             word_row.addWidget(self.word_hint)
             word_row.addStretch(1)
             word_column.addLayout(word_row)
@@ -291,7 +294,7 @@ class EditRecordDialog(MessageBoxBase):
             duration_row.setSpacing(8)
             duration_row.addWidget(self.duration_edit)
             self.duration_hint = CaptionLabel('', self)
-            self.duration_hint.setStyleSheet('color:#e5b45f;')
+            self.duration_hint.setTextColor('#b07c20', '#e5b45f')
             duration_row.addWidget(self.duration_hint)
             duration_row.addStretch(1)
             duration_column.addLayout(duration_row)
@@ -449,6 +452,41 @@ class _SelectableLabel(BodyLabel):
         menu.exec(event.globalPos())
 
 
+class _CoverLabel(QLabel):
+    """封面：宽度固定、高度可随窗口收缩，避免空间不足时压到相邻控件。"""
+
+    def __init__(self, width: int = 180, height: int = 260, parent=None):
+        super().__init__(parent)
+        self._source = None
+        self._preferred = QSize(width, height)
+        self.setAlignment(Qt.AlignCenter)
+        self.setFixedWidth(width)
+        self.setMinimumHeight(100)
+        self.setMaximumHeight(height)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+
+    def sizeHint(self) -> QSize:
+        return self._preferred
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(self._preferred.width(), self.minimumHeight())
+
+    def setSourcePixmap(self, pixmap: QPixmap) -> None:
+        self._source = pixmap
+        self._fit()
+
+    def _fit(self) -> None:
+        if self._source is None or self._source.isNull():
+            return
+        self.setPixmap(self._source.scaled(
+            max(self.width(), 1), max(self.height(), 1),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit()
+
+
 class MediaMetaDialog(MessageBoxBase):
     def __init__(self, db: Database, media_type: str, subject_id: str, title: str,
                  intro: str = '', parent=None):
@@ -554,9 +592,7 @@ class RecordDetailDialog(MessageBoxBase):
         left.setContentsMargins(0, 0, 0, 0)
         left.setSpacing(10)
         left.addWidget(StrongBodyLabel('记录信息', left_widget))
-        self.cover_label = QLabel(left_widget)
-        self.cover_label.setFixedSize(180, 260)
-        self.cover_label.setAlignment(Qt.AlignCenter)
+        self.cover_label = _CoverLabel(180, 260, left_widget)
         self.cover_label.setStyleSheet('background:#0f131b; border-radius:6px;')
         left.addWidget(self.cover_label, 0, Qt.AlignLeft)
         self.change_cover_button = PushButton(FluentIcon.PHOTO, '更换封面', left_widget)
@@ -564,8 +600,9 @@ class RecordDetailDialog(MessageBoxBase):
         left.addWidget(self.change_cover_button, 0, Qt.AlignLeft)
         self.info_layout = QVBoxLayout()
         self.info_layout.setSpacing(8)
-        left.addLayout(self.info_layout)
+        # 信息块贴底，让「时长」的底边与右侧资源区底边齐平。
         left.addStretch(1)
+        left.addLayout(self.info_layout)
         body.addWidget(left_widget, 1)
 
         right_widget = QWidget(self)
@@ -588,6 +625,7 @@ class RecordDetailDialog(MessageBoxBase):
         holder_layout.addWidget(self.comment_label)
         holder_layout.addStretch(1)
         self.comment_scroll.setWidget(holder)
+        self.comment_scroll.setMinimumHeight(120)
         right.addWidget(self.comment_scroll, 1)
 
         self.empty_box = QWidget(right_widget)
@@ -596,27 +634,60 @@ class RecordDetailDialog(MessageBoxBase):
         empty.addStretch(1)
         tip = CaptionLabel('暂时还没感想', self.empty_box)
         tip.setAlignment(Qt.AlignCenter)
-        tip.setTextColor('#8d95a5', '#8d95a5')
+        tip.setTextColor('#6f7887', '#8d95a5')
         empty.addWidget(tip)
         add_button = primary_button(FluentIcon.EDIT, '前去添加', self.empty_box)
         add_button.clicked.connect(self._edit)
         empty.addWidget(add_button, 0, Qt.AlignHCenter)
         empty.addStretch(1)
         right.addWidget(self.empty_box, 1)
+
+        self.resource_title = StrongBodyLabel('资源', right_widget)
+        right.addWidget(self.resource_title)
+        self.resource_box = QWidget(right_widget)
+        self.resource_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.resource_grid = QGridLayout(self.resource_box)
+        self.resource_grid.setContentsMargins(0, 0, 0, 0)
+        self.resource_grid.setHorizontalSpacing(8)
+        self.resource_grid.setVerticalSpacing(12)
+        right.addWidget(self.resource_box)
+
         body.addWidget(right_widget, 2)
         self.viewLayout.addLayout(body)
 
         self._refresh()
+        self._fit_height()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._fit_height()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """把弹窗高度限制在窗口可用范围内，剩余空间优先给感想区。"""
+        available = self.height()
+        if available <= 0:
+            return
+        # 上限压低到 620：再高的话左侧封面与评分之间会空出一大块。
+        target = max(460, min(620, available - 24))
+        if self.widget.minimumHeight() != target:
+            self.widget.setFixedHeight(target)
 
     def _refresh(self) -> None:
         record = self.record
         media_type = record['media_type']
         done_text = READ_LABELS.get(media_type, ('已读', '未读'))[0]
         self.title_label.setText(record['title'] or '')
-        self.subtitle_label.setText(
-            f"{MEDIA_LABELS.get(media_type, '')} · {done_text}")
+        subtitle = f"{MEDIA_LABELS.get(media_type, '')} · {done_text}"
+        if is_custom_cover(media_type, record['subject_id'], record['cover_path'] or ''):
+            subtitle += ' · 自定义封面（随云同步）'
+        self.subtitle_label.setText(subtitle)
 
-        self.cover_label.setPixmap(_cover_pixmap(record['cover_path'] or '', 180, 260, fill=True))
+        self.cover_label.setSourcePixmap(_cover_pixmap(record['cover_path'] or '', 180, 260, fill=True))
+        self._refresh_resources()
         while self.info_layout.count():
             item = self.info_layout.takeAt(0)
             widget = item.widget()
@@ -638,16 +709,40 @@ class RecordDetailDialog(MessageBoxBase):
             label = BodyLabel(text, self)
             label.setWordWrap(True)
             self.info_layout.addWidget(label)
-        if record['url']:
-            link = PushButton(FluentIcon.LINK, '打开豆瓣页面', self)
-            link.clicked.connect(
-                lambda: QDesktopServices.openUrl(QUrl(record['url'] or '')))
-            self.info_layout.addWidget(link, 0, Qt.AlignLeft)
 
         comment = (record['comment'] or '').strip()
         self.comment_label.setText(comment)
         self.comment_scroll.setVisible(bool(comment))
         self.empty_box.setVisible(not comment)
+
+    def _refresh_resources(self) -> None:
+        """按记录类型展示探索空间站点，并标注最近一次连通性检测结果。"""
+        while self.resource_grid.count():
+            item = self.resource_grid.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        media_type = self.record['media_type']
+        sites = explore.sites_for(explore.load_state(self.db), media_type)
+        self.resource_title.setVisible(bool(sites))
+        self.resource_box.setVisible(bool(sites))
+        if not sites:
+            return
+        title = (self.record['title'] or '').split(' / ')[0].strip()
+        for index, site in enumerate(sites):
+            status = explore.get_reachability(site['id'])
+            mark = '✓' if status is True else '✕' if status is False else '·'
+            state_text = '可访问' if status is True else '不可访问' if status is False else '未检测'
+            button = PushButton(f'{mark} {site["name"]}', self.resource_box)
+            button.setMinimumHeight(34)
+            button.setToolTip(f'{site["url"]}\n状态：{state_text}')
+            button.clicked.connect(
+                lambda _checked=False, item=site, text=title: QDesktopServices.openUrl(
+                    QUrl(explore.search_link(item, text))))
+            self.resource_grid.addWidget(button, index // 3, index % 3)
+        rows = (len(sites) + 2) // 3
+        # 给资源块一个明确的最小高度，避免弹窗变矮时行距被压扁、按钮互相压住。
+        self.resource_box.setMinimumHeight(rows * 34 + (rows - 1) * 12)
 
     def _change_cover(self) -> None:
         dialog = CoverChangeDialog(self.db, self.record, self)
@@ -1438,7 +1533,7 @@ class AddRecordDialog(MessageBoxBase):
             word_row.setSpacing(8)
             word_row.addWidget(self.word_edit)
             self.word_hint = CaptionLabel('', self)
-            self.word_hint.setStyleSheet('color:#e5b45f;')
+            self.word_hint.setTextColor('#b07c20', '#e5b45f')
             word_row.addWidget(self.word_hint)
             word_row.addStretch(1)
             word_column.addLayout(word_row)
@@ -1458,7 +1553,7 @@ class AddRecordDialog(MessageBoxBase):
             duration_row.setSpacing(8)
             duration_row.addWidget(self.duration_edit)
             self.duration_hint = CaptionLabel('', self)
-            self.duration_hint.setStyleSheet('color:#e5b45f;')
+            self.duration_hint.setTextColor('#b07c20', '#e5b45f')
             duration_row.addWidget(self.duration_hint)
             duration_row.addStretch(1)
             duration_column.addLayout(duration_row)
@@ -1968,6 +2063,10 @@ class SnapshotPickerDialog(MessageBoxBase):
             book_meta = counts.get('book_meta', 0)
             if book_meta:
                 data_parts.append(f"{book_meta} 条书籍元数据")
+            ignored = counts.get('ignored_subjects', 0)
+            purged = counts.get('purged_records', 0)
+            if ignored or purged:
+                data_parts.append(f"忽略 {ignored} 条 · 删除标记 {purged} 条")
             updated = item.get('records_updated') or ''
             if updated:
                 data_parts.append(f"最近更新 {self._fmt_time(updated)}")
@@ -2164,13 +2263,13 @@ class WordCountDialog(MessageBoxBase):
         self.calibre = find_calibre()
         if self.calibre:
             self.calibre_label.setText(f'已检测到 calibre：{self.calibre}')
-            self.calibre_label.setStyleSheet('color:#7fae68;')
+            self.calibre_label.setTextColor('#4f7d3a', '#7fae68')
             self.calibre_download_button.hide()
         else:
             self.calibre_label.setText(
                 '未检测到 calibre：仅能直接统计 EPUB / TXT / DOCX 的字数。'
             )
-            self.calibre_label.setStyleSheet('color:#d98a4a;')
+            self.calibre_label.setTextColor('#b4661f', '#d98a4a')
             self.calibre_download_button.show()
 
     def _open_calibre_install(self) -> None:

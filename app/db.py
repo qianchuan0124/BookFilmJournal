@@ -64,6 +64,12 @@ CREATE TABLE IF NOT EXISTS doulist_items (
     intro TEXT NOT NULL DEFAULT '',
     position INTEGER NOT NULL DEFAULT 0,
     create_time TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'done',
+    duration_minutes INTEGER NOT NULL DEFAULT 0,
+    pages INTEGER NOT NULL DEFAULT 0,
+    word_count INTEGER NOT NULL DEFAULT 0,
+    year TEXT NOT NULL DEFAULT '',
+    release_date TEXT NOT NULL DEFAULT '',
     UNIQUE(doulist_id, media_type, subject_id)
 );
 CREATE TABLE IF NOT EXISTS plan_folders (
@@ -91,6 +97,8 @@ CREATE TABLE IF NOT EXISTS plan_items (
     position INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'done',
+    release_date TEXT NOT NULL DEFAULT '',
     UNIQUE(folder_id, media_type, subject_id)
 );
 CREATE TABLE IF NOT EXISTS book_words (
@@ -255,6 +263,25 @@ class Database:
                 conn.execute('ALTER TABLE doulists ADD COLUMN position INTEGER NOT NULL DEFAULT 0')
             if 'deleted_at' not in doulist_columns:
                 conn.execute("ALTER TABLE doulists ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''")
+            # iOS 侧条目带状态/时长/页数/字数/年份/上映日期，补齐列以便 Excel 双向无损。
+            for table, extra in (
+                ('doulist_items', (
+                    ('status', "TEXT NOT NULL DEFAULT 'done'"),
+                    ('duration_minutes', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('pages', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('word_count', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('year', "TEXT NOT NULL DEFAULT ''"),
+                    ('release_date', "TEXT NOT NULL DEFAULT ''"),
+                )),
+                ('plan_items', (
+                    ('status', "TEXT NOT NULL DEFAULT 'done'"),
+                    ('release_date', "TEXT NOT NULL DEFAULT ''"),
+                )),
+            ):
+                present = [row[1] for row in conn.execute(f'PRAGMA table_info({table})')]
+                for column, definition in extra:
+                    if column not in present:
+                        conn.execute(f'ALTER TABLE {table} ADD COLUMN {column} {definition}')
             order_marker = conn.execute(
                 "SELECT value FROM settings WHERE key='doulist_order_global'"
             ).fetchone()
@@ -443,12 +470,17 @@ class Database:
         inserted = 0
         updated = 0
         skipped = 0
+        ignored = self.ignored_subjects()
         purged = self.purged_subjects()
         with self._connect() as conn:
             for record in records:
                 media_type = record['media_type']
                 subject_id = str(record['subject_id'])
                 status = record.get('status') or 'done'
+                # 换源忽略的旧条目、彻底删除的墓碑都不再从 Excel 导入回来。
+                if (media_type, subject_id) in ignored:
+                    skipped += 1
+                    continue
                 if (media_type, subject_id, status) in purged:
                     skipped += 1
                     continue
@@ -1238,13 +1270,17 @@ class Database:
         conn.executemany(f'''
             {verb} INTO doulist_items (
                 doulist_id, media_type, subject_id, title, url, cover_url, cover_path,
-                rating, comment, intro, position, create_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                rating, comment, intro, position, create_time,
+                status, duration_minutes, pages, word_count, year, release_date
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', [(
             doulist_id, item['media_type'], item['subject_id'], item['title'],
             item.get('url', ''), item.get('cover_url', ''), item.get('cover_path', ''),
             int(item.get('rating') or 0), item.get('comment', ''), item.get('intro', ''),
             item.get('position', 0), item.get('create_time', ''),
+            item.get('status') or 'done', int(item.get('duration_minutes') or 0),
+            int(item.get('pages') or 0), int(item.get('word_count') or 0),
+            item.get('year') or '', item.get('release_date') or '',
         ) for item in items])
 
     def replace_doulist_items(self, doulist_id: int, items: list[dict]) -> None:
@@ -1462,25 +1498,28 @@ class Database:
                 conn.execute('''
                     UPDATE plan_items SET
                         title=?, url=?, cover_url=?, cover_path=?, source=?, source_id=?,
-                        note=?, position=?, deleted_at=?
+                        note=?, position=?, deleted_at=?, status=?, release_date=?
                     WHERE id=?
                 ''', (
                     item.get('title', ''), item.get('url', ''), item.get('cover_url', ''),
                     item.get('cover_path', ''), item.get('source', ''),
                     str(item.get('source_id', '')), item.get('note', ''), int(position),
-                    deleted, existing['id'],
+                    deleted, item.get('status') or 'done', item.get('release_date') or '',
+                    existing['id'],
                 ))
                 return int(existing['id'])
             cursor = conn.execute('''
                 INSERT INTO plan_items (
                     folder_id, media_type, subject_id, title, url, cover_url, cover_path,
-                    source, source_id, note, position, created_at, deleted_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source, source_id, note, position, created_at, deleted_at,
+                    status, release_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 folder_id, media_type, subject_id, item.get('title', ''),
                 item.get('url', ''), item.get('cover_url', ''), item.get('cover_path', ''),
                 item.get('source', ''), str(item.get('source_id', '')), item.get('note', ''),
-                int(position), now, deleted,
+                int(position), now, deleted, item.get('status') or 'done',
+                item.get('release_date') or '',
             ))
             return int(cursor.lastrowid or 0)
 
@@ -1687,25 +1726,27 @@ class Database:
                 conn.execute('''
                     UPDATE plan_items SET
                         title=?, url=?, cover_url=?, cover_path=?, source=?, source_id=?,
-                        note=?, position=?, created_at=?, deleted_at=''
+                        note=?, position=?, created_at=?, deleted_at='', status=?, release_date=?
                     WHERE id=?
                 ''', (
                     item.get('title', ''), item.get('url', ''), item.get('cover_url', ''),
                     item.get('cover_path', ''), item.get('source', ''),
                     str(item.get('source_id', '')), item.get('note', ''), int(position),
-                    now, existing['id'],
+                    now, item.get('status') or 'done', item.get('release_date') or '',
+                    existing['id'],
                 ))
                 return int(existing['id'])
             cursor = conn.execute('''
                 INSERT INTO plan_items (
                     folder_id, media_type, subject_id, title, url, cover_url, cover_path,
-                    source, source_id, note, position, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source, source_id, note, position, created_at, status, release_date
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 folder_id, media_type, subject_id, item.get('title', ''), item.get('url', ''),
                 item.get('cover_url', ''), item.get('cover_path', ''),
                 item.get('source', ''), str(item.get('source_id', '')), item.get('note', ''),
-                int(position), now,
+                int(position), now, item.get('status') or 'done',
+                item.get('release_date') or '',
             ))
             return int(cursor.lastrowid or 0)
 

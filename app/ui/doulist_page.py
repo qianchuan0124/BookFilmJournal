@@ -24,7 +24,8 @@ from app.ui.segmented import SegmentedSwitch
 from app.ui.styles import progress_style, surface_style, primary_button
 
 RELATION_LABELS = {'created': '我创建的', 'followed': '我关注的'}
-RELATION_COLORS = {'created': '#e5b45f', 'followed': '#55b7a5'}
+RELATION_COLORS = {'created': ('#b07c20', '#e5b45f'),
+                   'followed': ('#1f8a70', '#55b7a5')}
 
 
 def _count_text(media_type: str, read: int, total: int) -> str:
@@ -95,7 +96,8 @@ class DoulistListCard(QFrame):
         layout.addWidget(title)
         footer = QHBoxLayout()
         relation = CaptionLabel(RELATION_LABELS.get(doulist['relation'], '豆列'), self)
-        relation.setStyleSheet(f"color:{RELATION_COLORS.get(doulist['relation'], '#8d95a5')};")
+        relation.setTextColor(*RELATION_COLORS.get(doulist['relation'],
+                                             ('#5f6b7a', '#8d95a5')))
         footer.addWidget(relation)
         if doulist['media_type'] not in ('movie', 'book'):
             mixed = CaptionLabel('混合', self)
@@ -118,7 +120,7 @@ class DoulistListCard(QFrame):
         layout.addWidget(progress)
         if total and read == total:
             complete = CaptionLabel('已看完' if doulist['media_type'] == 'movie' else '已读完', self)
-            complete.setStyleSheet('color:#7fae68;')
+            complete.setTextColor('#4f7d3a', '#7fae68')
             footer.addWidget(complete)
         up_button = TransparentToolButton(FluentIcon.UP, self)
         up_button.setIconSize(QSize(12, 12))
@@ -203,13 +205,13 @@ class DoulistDetailRow(QFrame):
         if item['comment']:
             comment = CaptionLabel('', self)
             comment.setText(metrics.elidedText(item['comment'], Qt.ElideRight, 760))
-            comment.setStyleSheet('color:#c9c5bb;')
+            comment.setTextColor('#7a7466', '#c9c5bb')
             info.addWidget(comment)
         info.addStretch(1)
         footer = QHBoxLayout()
         footer.setSpacing(2)
         media = CaptionLabel(MEDIA_LABELS.get(item['media_type'], item['media_type']), self)
-        media.setStyleSheet('color:#e5b45f;')
+        media.setTextColor('#b07c20', '#e5b45f')
         footer.addWidget(media)
         edit_button = TransparentToolButton(FluentIcon.EDIT, self)
         edit_button.setIconSize(QSize(12, 12))
@@ -337,7 +339,7 @@ class DoulistPage(QWidget):
         title_box.setSpacing(2)
         self.detail_title = TitleLabel('豆列', page)
         self.detail_meta = CaptionLabel('', page)
-        self.detail_meta.setStyleSheet('color:#b9b5aa;')
+        self.detail_meta.setTextColor('#5f6b7a', '#b9b5aa')
         title_box.addWidget(self.detail_title)
         title_box.addWidget(self.detail_meta)
         self.detail_progress = QProgressBar(page)

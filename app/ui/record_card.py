@@ -17,6 +17,7 @@ from qfluentwidgets import (
 )
 
 from app.config import CACHE_DIR, MEDIA_LABELS, ROOT
+from app.cover_sync import is_custom_cover
 from app.media_meta import book_stats_text, movie_stats_text
 
 
@@ -288,6 +289,15 @@ class RecordCard(CardWidget):
         cover.setPixmap(_empty_pixmap(194, 272))
         cover.setStyleSheet('background:#0f131b; border-radius:7px;')
         self.cover_label = cover
+        self.cover_sync_tag = QLabel(' 同步 ', cover)
+        self.cover_sync_tag.setStyleSheet(
+            'color:#241804; background:rgba(229,180,95,0.92); border-radius:9px;'
+            ' font-size:10px; font-weight:600; padding:0 2px;')
+        self.cover_sync_tag.setToolTip('自定义封面，豆瓣无法重新获取，会随云同步保存')
+        self.cover_sync_tag.adjustSize()
+        self.cover_sync_tag.move(194 - self.cover_sync_tag.width() - 8, 8)
+        self.cover_sync_tag.setVisible(is_custom_cover(
+            record['media_type'], record['subject_id'], record['cover_path'] or ''))
         layout.addWidget(cover)
         self._request_cover(record['cover_path'] or '')
 
@@ -315,7 +325,10 @@ class RecordCard(CardWidget):
         meta.setSpacing(5)
         stars = int(record['rating'] or 0)
         star_label = BodyLabel('★' * stars + '☆' * (5 - stars) if stars else '未评分', self)
-        star_label.setStyleSheet('color:#e5b45f; font-size:12px;')
+        star_font = star_label.font()
+        star_font.setPixelSize(12)
+        star_label.setFont(star_font)
+        star_label.setTextColor('#b07c20', '#e5b45f')
         self.star_label = star_label
         meta.addWidget(star_label)
         meta.addStretch(1)
@@ -324,7 +337,7 @@ class RecordCard(CardWidget):
         self.date_label = date_label
         meta.addWidget(date_label)
         local = CaptionLabel('本地', self)
-        local.setStyleSheet('color:#e5b45f;')
+        local.setTextColor('#b07c20', '#e5b45f')
         local.setToolTip('本地修改过的评分/短评/日期，同步时不会覆盖')
         local.setVisible(bool(
             record['date_overridden'] or record['rating_overridden']
@@ -357,7 +370,7 @@ class RecordCard(CardWidget):
         else:
             type_text = MEDIA_LABELS[record['media_type']]
         type_label = CaptionLabel(type_text, self)
-        type_label.setStyleSheet('color:#e5b45f;')
+        type_label.setTextColor('#b07c20', '#e5b45f')
         self.type_label = type_label
         actions.addWidget(type_label)
         actions.addStretch(1)
@@ -438,6 +451,8 @@ class RecordCard(CardWidget):
             record['date_overridden'] or record['rating_overridden']
             or record['comment_overridden']
         ))
+        self.cover_sync_tag.setVisible(is_custom_cover(
+            record['media_type'], record['subject_id'], record['cover_path'] or ''))
         if record['status'] == 'wish':
             type_text = '想看' if record['media_type'] == 'movie' else '想读'
         else:

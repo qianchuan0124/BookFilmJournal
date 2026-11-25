@@ -6,7 +6,9 @@ from pathlib import Path
 from typing import Optional
 
 from app.db import Database
-from app.media_meta import book_pages, movie_stats_text
+from app.media_meta import (
+    book_pages, movie_duration, parse_duration, set_book_pages, set_movie_duration,
+)
 
 RECORD_HEADERS = [
     '类型', '状态', '豆瓣ID', '标题', '链接', '评分', '豆瓣标记日期', '本地生效日期',
@@ -17,11 +19,13 @@ DOULIST_HEADERS = ['类型', '豆列ID', '标题', '链接', '条目数', '关�
 DOULIST_ITEM_HEADERS = [
     '豆列ID', '类型', '条目ID', '标题', '链接', '封面URL', '封面路径',
     '评分', '短评', '简介', '位置', '创建时间',
+    # 下面几列来自 iOS，桌面端只做存储与回写，保证两端互导不丢字段。
+    '状态', '时长', '页数', '字数', '年份', '上映日期',
 ]
 PLAN_FOLDER_HEADERS = ['类型', '计划名称', '备注', '顺序']
 BOOK_WORD_HEADERS = ['豆瓣ID', '字数', '电子书文件']
 PLAN_HEADERS = ['计划名称', '顺序', '类型', '条目ID', '标题', '链接', '封面URL',
-                '封面路径', '来源', '来源ID', '备注']
+                '封面路径', '来源', '来源ID', '备注', '状态', '上映日期']
 RECYCLE_RECORD_HEADERS = RECORD_HEADERS + ['删除时间', '删除来源']
 RECYCLE_DOULIST_HEADERS = DOULIST_HEADERS + ['删除时间']
 RECYCLE_PLAN_FOLDER_HEADERS = PLAN_FOLDER_HEADERS + ['删除时间']
@@ -61,7 +65,7 @@ def _record_row(row) -> list:
         '是' if row['rating_overridden'] else '否',
         '是' if row['comment_overridden'] else '否',
         row['comment'], row['intro'], row['cover_url'], row['cover_path'],
-        movie_stats_text(row['intro'], row['subject_id']) if media_type == 'movie' else '',
+        (movie_duration(row['subject_id']) or '') if media_type == 'movie' else '',
         book_pages(row['subject_id']) or '' if media_type == 'book' else '',
         int(row['word_count'] or 0), row['book_file'], row['source'],
     ]
@@ -72,7 +76,18 @@ def _doulist_item_row(douban_id: str, item) -> list:
         douban_id, item['media_type'], item['subject_id'], item['title'],
         item['url'], item['cover_url'], item['cover_path'], item['rating'],
         item['comment'], item['intro'], item['position'], item['create_time'],
+        _status_text(item['media_type'], item['status']),
+        _meta_int(item, 'duration_minutes'), _meta_int(item, 'pages'),
+        _meta_int(item, 'word_count'), item['year'], item['release_date'],
     ]
+
+
+def _meta_int(item, key: str) -> object:
+    try:
+        value = int(item[key] or 0)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return ''
+    return value or ''
 
 
 def _deleted_by_text(value: str) -> str:
@@ -145,6 +160,7 @@ def export_excel(db: Database, path: str) -> dict:
                     folder['title'], position, media_type, item['subject_id'], item['title'],
                     item['url'], item['cover_url'], item['cover_path'], item['source'],
                     item['source_id'], item['note'],
+                    _status_text(media_type, item['status']), item['release_date'],
                 ])
         _write_sheet(ws, PLAN_HEADERS, rows)
 
@@ -187,6 +203,7 @@ def export_excel(db: Database, path: str) -> dict:
             item['folder_title'] or '默认计划', item['position'], item['media_type'],
             item['subject_id'], item['title'], item['url'], item['cover_url'],
             item['cover_path'], item['source'], item['source_id'], item['note'],
+            _status_text(item['media_type'], item['status']), item['release_date'],
             item['deleted_at'],
         ])
     _write_sheet(ws, RECYCLE_PLAN_HEADERS, recycle_plan_rows)
@@ -272,6 +289,16 @@ def _parse_status(value) -> str:
     return 'done'
 
 
+def _parse_item_status(value) -> str:
+    """豆列条目 / 计划的「状态」列：iOS 写的是「已读/已看」与「未读/未看」。"""
+    text = _text(value).strip()
+    if not text:
+        return 'done'
+    if '未' in text or '想' in text or text.lower() == 'wish':
+        return 'wish'
+    return 'done'
+
+
 def _parse_media_type(value, fallback: str) -> str:
     text = _text(value).lower()
     if text in ('movie', '观影', '影视', '电影'):
@@ -299,8 +326,9 @@ def _record_from_row(row: dict, fallback_type: str) -> Optional[dict]:
         return None
     media_type = _parse_media_type(row.get('类型'), fallback_type)
     status = _parse_status(row.get('状态'))
-    marked_date = _date_text(row.get('豆瓣标记日期'))
-    effective_date = _date_text(row.get('本地生效日期')) or marked_date
+    marked_date = _date_text(row.get('豆瓣标记日期') or row.get('标记日期'))
+    effective_date = (_date_text(row.get('本地生效日期') or row.get('生效日期'))
+                      or marked_date)
     return {
         'media_type': media_type,
         'status': status,
@@ -320,7 +348,22 @@ def _record_from_row(row: dict, fallback_type: str) -> Optional[dict]:
         'word_count': _int(row.get('字数')),
         'book_file': _text(row.get('电子书文件')),
         'source': _text(row.get('来源')) or 'excel',
+        # 时长 / 页数不属于 records 列，导入后写入本机元数据缓存。
+        '_duration': _duration_minutes(row.get('时长')),
+        '_pages': _int(row.get('页数')),
     }
+
+
+def _duration_minutes(value) -> int:
+    """时长列既可能是分钟数，也可能是「3 小时 38 分」这种旧格式。"""
+    text = _text(value).strip()
+    if not text:
+        return 0
+    try:
+        return max(0, int(float(text)))
+    except (TypeError, ValueError):
+        pass
+    return int(parse_duration(text) or 0)
 
 
 def _doulist_item_from_row(row: dict) -> Optional[dict]:
@@ -328,8 +371,9 @@ def _doulist_item_from_row(row: dict) -> Optional[dict]:
     title = _text(row.get('标题'))
     if not subject_id or not title:
         return None
+    media_type = _parse_media_type(row.get('类型'), 'movie')
     return {
-        'media_type': _parse_media_type(row.get('类型'), 'movie'),
+        'media_type': media_type,
         'subject_id': subject_id,
         'title': title,
         'url': _text(row.get('链接')),
@@ -339,8 +383,28 @@ def _doulist_item_from_row(row: dict) -> Optional[dict]:
         'comment': _text(row.get('短评')),
         'intro': _text(row.get('简介')),
         'position': _int(row.get('位置')),
+        'status': _parse_item_status(row.get('状态')),
+        'duration_minutes': _duration_minutes(row.get('时长')),
+        'pages': _int(row.get('页数')),
+        'word_count': _int(row.get('字数')),
+        'year': _text(row.get('年份')),
+        'release_date': _text(row.get('上映日期')),
         'create_time': _text(row.get('创建时间')),
     }
+
+
+def _apply_metadata(records: list[dict], db: Database) -> None:
+    """把导入表格里的时长 / 页数写回本机元数据（作为手动值）。"""
+    seen: set[tuple[str, str]] = set()
+    for record in records:
+        key = (record['media_type'], str(record['subject_id']))
+        if key in seen:
+            continue
+        seen.add(key)
+        if record['media_type'] == 'movie' and record.get('_duration'):
+            set_movie_duration(record['subject_id'], record['_duration'])
+        elif record['media_type'] == 'book' and record.get('_pages'):
+            set_book_pages(record['subject_id'], record['_pages'], db=db)
 
 
 def import_excel(db: Database, path: str) -> dict:
@@ -377,6 +441,7 @@ def import_excel(db: Database, path: str) -> dict:
             result = db.import_records(record_rows)
             stats['records_inserted'] += result['inserted']
             stats['records_updated'] += result['updated']
+            _apply_metadata(record_rows, db)
         else:
             for sheet_name in ('观影记录', '读书记录'):
                 if sheet_name not in workbook.sheetnames:
@@ -390,6 +455,7 @@ def import_excel(db: Database, path: str) -> dict:
                 result = db.import_records(record_rows)
                 stats['records_inserted'] += result['inserted']
                 stats['records_updated'] += result['updated']
+                _apply_metadata(record_rows, db)
 
         if '书籍字数' in workbook.sheetnames:
             for row in _rows_as_dicts(workbook['书籍字数']):
@@ -474,6 +540,8 @@ def import_excel(db: Database, path: str) -> dict:
                     'source': _text(row.get('来源')),
                     'source_id': _text(row.get('来源ID')),
                     'note': _text(row.get('备注')),
+                    'status': _parse_item_status(row.get('状态')),
+                    'release_date': _text(row.get('上映日期')),
                 }, folder_id=folder_id, position=position if position >= 0 else None)
                 if added:
                     stats['plans_added'] += 1
@@ -570,6 +638,8 @@ def import_excel(db: Database, path: str) -> dict:
                     'source_id': _text(row.get('来源ID')),
                     'note': _text(row.get('备注')),
                     'position': position if position >= 0 else None,
+                    'status': _parse_item_status(row.get('状态')),
+                    'release_date': _text(row.get('上映日期')),
                 }, folder_id, deleted_at=deleted_at)
                 if added:
                     stats['recycle_plan_items'] += 1

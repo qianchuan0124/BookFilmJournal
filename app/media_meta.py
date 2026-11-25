@@ -67,8 +67,9 @@ def dot_date(date_str: str) -> str:
 
 def parse_duration(intro: str) -> Optional[int]:
     text = intro or ''
-    hours = re.search(r'(\d+)\s*小时', text)
-    minutes = re.search(r'(\d+)\s*分钟', text)
+    hours = re.search(r'(\d+)\s*(?:小时|时)', text)
+    # 兼容「138 分钟」和「3 小时 38 分」两种写法。
+    minutes = re.search(r'(\d+)\s*分(?:钟)?', text)
     if not hours and not minutes:
         return None
     return int(hours.group(1) if hours else 0) * 60 + int(minutes.group(1) if minutes else 0)
@@ -387,6 +388,28 @@ def ensure_subject_meta(media_type: str, subjects,
     else:
         load_movie_meta.cache_clear()
     return {'fetched': fetched, 'failed': failed, 'skipped': len(unique) - len(missing)}
+
+
+def import_movie_durations(items) -> int:
+    """把 iOS 快照 sidecar 里的影片时长写入本机缓存（不覆盖手动值）。"""
+    cache = _read_json(MOVIE_META_CACHE)
+    imported = 0
+    for subject_id, minutes in items:
+        try:
+            value = int(minutes)
+        except (TypeError, ValueError):
+            continue
+        if value <= 0:
+            continue
+        entry = cache.setdefault(str(subject_id), {})
+        if entry.get('duration_manual') or entry.get('durations'):
+            continue
+        entry['durations'] = [f'{value}分钟']
+        imported += 1
+    if imported:
+        _write_json(MOVIE_META_CACHE, cache)
+        load_movie_meta.cache_clear()
+    return imported
 
 
 def format_book_stats(pages: Optional[int], word_count: int = 0) -> str:

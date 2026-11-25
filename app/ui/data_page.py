@@ -463,7 +463,7 @@ class DataPage(QWidget):
         self.account_name_edit.setAlignment(Qt.AlignLeft)
         self.account_name_edit.editingFinished.connect(self._on_name_edit_finished)
         self.name_counter = CaptionLabel('还可输入 10 个字', card)
-        self.name_counter.setTextColor('#e5b45f', '#e5b45f')
+        self.name_counter.setTextColor('#b07c20', '#e5b45f')
         counter_font = self.name_counter.font()
         counter_font.setPixelSize(10)
         self.name_counter.setFont(counter_font)
@@ -777,9 +777,12 @@ class DataPage(QWidget):
                     else:
                         compared = '（记录数与本机相同）'
                     records_text = f'记录 {counts.get("records", 0)} 条'
+                device_text = manifest.get('device', '未知设备')
+                if manifest.get('platform'):
+                    device_text += f' · {manifest.get("platform")}'
                 lines.append(
                     f'最近备份：{manifest.get("created_at", "未知时间")}'
-                    f' · {manifest.get("device", "未知设备")}'
+                    f' · {device_text}'
                     f' · {records_text}{compared}'
                 )
         elif info['folder'] and Path(info['folder']).is_dir():
@@ -948,13 +951,13 @@ class DataPage(QWidget):
         calibre = find_calibre()
         if calibre:
             self.calibre_label.setText(f'calibre：{calibre}')
-            self.calibre_label.setStyleSheet('color:#7fae68;')
+            self.calibre_label.setTextColor('#4f7d3a', '#7fae68')
             self.calibre_download_button.hide()
         else:
             self.calibre_label.setText(
                 'calibre：未检测到，仅能直接统计 EPUB / TXT / DOCX 字数。'
             )
-            self.calibre_label.setStyleSheet('color:#d98a4a;')
+            self.calibre_label.setTextColor('#b4661f', '#d98a4a')
             self.calibre_download_button.show()
 
     def open_calibre_install(self) -> None:

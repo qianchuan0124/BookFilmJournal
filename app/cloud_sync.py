@@ -15,14 +15,17 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from app import explore
 from app.config import APP_VERSION, DB_PATH
-from app.media_meta import sync_book_pages
+from app.cover_sync import is_custom_cover, read_cover_base64, save_cover_base64
+from app.media_meta import import_movie_durations, movie_duration, sync_book_pages
 
 SYNC_SUBDIR = '书影记录'
+DEVICES_NAME = 'devices.json'
 SNAPSHOT_PREFIX = 'douban_trace_'
 SNAPSHOT_SUFFIX = '.db'
 ICLOUD_STUB_SUFFIX = f'{SNAPSHOT_SUFFIX}.icloud'
@@ -34,7 +37,7 @@ KIND_AUTO = 'auto'
 KIND_MANUAL = 'manual'
 SNAPSHOT_NAME_RE = re.compile(
     rf'^{re.escape(SNAPSHOT_PREFIX)}(\d{{8}}_\d{{6}})_([0-9a-f]{{4}})'
-    rf'(?:_({KIND_AUTO}|{KIND_MANUAL}))?(?:_\d+)?{re.escape(SNAPSHOT_SUFFIX)}$'
+    rf'(?:_({KIND_AUTO}|{KIND_MANUAL}))?(?:_(\d+))?{re.escape(SNAPSHOT_SUFFIX)}$'
 )
 LOCAL_BACKUP_KEEP = 5
 
@@ -62,6 +65,10 @@ SETTING_LAST_TIME = 'cloud_sync_last_time'
 SETTING_LAST_SNAPSHOT = 'cloud_sync_last_snapshot'
 SETTING_AUTO_BACKUP = 'cloud_sync_auto_backup'
 SETTING_AUTO_SYNC = 'cloud_sync_auto_sync'
+# 快照里声明「ignored_subjects / purged_records 由写入方维护」的标记；
+# 老快照没有这个键，恢复时按 iOS 旧版本保守处理。
+SETTING_MARKS_VERSION = 'snapshot_marks_version'
+MARKS_VERSION = '1'
 
 
 class SyncError(Exception):
@@ -113,11 +120,34 @@ def base_dir(db) -> Optional[Path]:
     return candidates[0][1] if candidates else None
 
 
+def _has_snapshot_data(folder: Path) -> bool:
+    """目录里是否已经有快照、清单或设备登记。"""
+    if not folder.is_dir():
+        return False
+    try:
+        for path in folder.iterdir():
+            name = path.name
+            if name in (MANIFEST_NAME, DEVICES_NAME) or name.startswith(SNAPSHOT_PREFIX):
+                return True
+    except OSError:
+        return False
+    return False
+
+
 def sync_folder(db, create: bool = False) -> Optional[Path]:
+    """定位实际读写快照的目录。
+
+    与 iOS 一致：用户选的就是「书影记录」文件夹时直接用它；否则在所选根目录下
+    创建 `书影记录/`。早前版本会在「书影记录」里再套一层，已有数据时继续用那一层。
+    """
     root = base_dir(db)
     if root is None:
         return None
-    folder = root / SYNC_SUBDIR
+    folder = root
+    if root.name != SYNC_SUBDIR:
+        folder = root / SYNC_SUBDIR
+    elif not _has_snapshot_data(root) and _has_snapshot_data(root / SYNC_SUBDIR):
+        folder = root / SYNC_SUBDIR
     if create:
         folder.mkdir(parents=True, exist_ok=True)
     return folder
@@ -227,43 +257,115 @@ def _snapshot_info(name: str) -> Optional[dict]:
         created = datetime.strptime(stamp, '%Y%m%d_%H%M%S')
     except ValueError:
         return None
-    return {'snapshot': name, 'tag': tag, 'kind': kind, 'created': created}
+    # 同一秒内基础名可能被复用，用序号区分先后（基础名为 1）。
+    seq = int(match.group(4) or 1)
+    return {'snapshot': name, 'tag': tag, 'kind': kind,
+            'created': created, 'seq': seq}
 
 
 def _iter_snapshot_files(folder: Path):
-    """遍历快照文件，同时识别 iCloud 尚未下载的占位文件，产出（真实文件名, 路径, 是否占位）。"""
+    """遍历快照文件，同时识别 iCloud 尚未下载的占位文件，产出（真实文件名, 路径, 是否占位）。
+
+    下载过程中可能同时存在真实文件与 `.icloud` 占位文件；同一份快照只产出一次，
+    真实文件优先，避免列表出现重复项或清理时误删。
+    """
+    real: dict[str, Path] = {}
+    stubs: dict[str, Path] = {}
     for path in folder.iterdir():
         name = path.name
         if name.startswith('.') and name.endswith(ICLOUD_STUB_SUFFIX):
             real_name = name[1:-len(ICLOUD_STUB_SUFFIX)] + SNAPSHOT_SUFFIX
-            yield real_name, path, True
+            stubs[real_name] = path
         elif name.startswith(SNAPSHOT_PREFIX) and name.endswith(SNAPSHOT_SUFFIX):
-            yield name, path, False
+            real[name] = path
+    for name, path in real.items():
+        yield name, path, False
+    for name, path in stubs.items():
+        if name not in real:
+            yield name, path, True
 
 
 def _prune_snapshots(folder: Path) -> None:
     """每台设备的自动/手动快照分别只保留最近几份，避免同步目录无限增长。"""
-    groups: dict[tuple, list[str]] = {}
+    groups: dict[tuple, list[tuple]] = {}
     for name, _path, _stub in _iter_snapshot_files(folder):
         info = _snapshot_info(name)
         if info:
-            groups.setdefault((info['tag'], info['kind']), []).append(name)
-    for (tag, kind), names in groups.items():
+            groups.setdefault((info['tag'], info['kind']), []).append(
+                (info['created'], info['seq'], name))
+    for (tag, kind), entries in groups.items():
         keep = SNAPSHOT_KEEP_AUTO if kind == KIND_AUTO else SNAPSHOT_KEEP_MANUAL
-        names.sort(reverse=True)
-        for name in names[keep:]:
-            try:
-                (folder / name).unlink()
-            except OSError:
+        # 按「时间 + 同秒序号」排序，避免基础名在清理后被复用导致误删最新的快照。
+        entries.sort(reverse=True)
+        for _created, _seq, name in entries[keep:]:
+            # 快照本体、iOS 侧车文件（.db.ios.json）以及未下载占位一起清理。
+            for path in (folder / name, folder / f'{name}.ios.json'):
                 try:
-                    (folder / f'.{name}.icloud').unlink()
+                    path.unlink()
                 except OSError:
                     pass
+            try:
+                (folder / f'.{name}.icloud').unlink()
+            except OSError:
+                pass
 
 
 def _device_tag() -> str:
     name = platform.node() or 'device'
     return hashlib.sha1(name.encode('utf-8')).hexdigest()[:4]
+
+
+def device_profile() -> dict:
+    """当前设备的可读信息：名称、系统、架构。"""
+    system = platform.system()
+    if system == 'Darwin':
+        label = 'macOS'
+    elif system == 'Windows':
+        label = 'Windows'
+    elif system == 'Linux':
+        label = 'Linux'
+    else:
+        label = system or '未知系统'
+    return {
+        'tag': _device_tag(),
+        'name': platform.node() or '未知设备',
+        'platform': label,
+        'arch': platform.machine() or '',
+    }
+
+
+def _load_devices(folder: Optional[Path]) -> dict:
+    if folder is None:
+        return {}
+    path = folder / DEVICES_NAME
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _remember_device(folder: Path) -> None:
+    """把本机名称/系统登记到 devices.json，供历史快照显示可读设备名。"""
+    profile = device_profile()
+    devices = _load_devices(folder)
+    devices[profile['tag']] = {
+        'name': profile['name'],
+        'platform': profile['platform'],
+        'arch': profile['arch'],
+        'last_seen': _now_text(),
+    }
+    temp = folder / f'.{DEVICES_NAME}.part'
+    try:
+        temp.write_text(json.dumps(devices, ensure_ascii=False, indent=2), encoding='utf-8')
+        os.replace(temp, folder / DEVICES_NAME)
+    except OSError:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def list_snapshots(folder: Optional[Path]) -> list[dict]:
@@ -273,6 +375,7 @@ def list_snapshots(folder: Optional[Path]) -> list[dict]:
     manifest = load_manifest(folder)
     latest_name = (manifest or {}).get('snapshot', '')
     own_tag = _device_tag()
+    devices = _load_devices(folder)
     items = []
     for name, path, stub in _iter_snapshot_files(folder):
         info = _snapshot_info(name)
@@ -280,9 +383,16 @@ def list_snapshots(folder: Optional[Path]) -> list[dict]:
             continue
         created_at = info['created'].strftime('%Y-%m-%d %H:%M:%S')
         device = '本机' if info['tag'] == own_tag else f'其他设备（{info["tag"]}）'
+        known = devices.get(info['tag']) or {}
+        if info['tag'] != own_tag and known.get('name'):
+            device = str(known['name'])
         if manifest and name == latest_name:
             created_at = manifest.get('created_at') or created_at
             device = manifest.get('device') or device
+        platform_label = ((manifest or {}).get('platform') if name == latest_name else '') \
+            or known.get('platform') or ''
+        if platform_label:
+            device = f'{device} · {platform_label}'
         size = 0
         counts: Optional[dict] = None
         records_updated = ''
@@ -310,6 +420,7 @@ def list_snapshots(folder: Optional[Path]) -> list[dict]:
             'kind': info['kind'],
             'created_at': created_at,
             'created_ts': int(info['created'].timestamp()),
+            'seq': info['seq'],
             'device': device,
             'is_mine': info['tag'] == own_tag,
             'is_latest': name == latest_name,
@@ -321,19 +432,441 @@ def list_snapshots(folder: Optional[Path]) -> list[dict]:
             if name == latest_name else '',
             'sha256': (manifest or {}).get('sha256', '') if name == latest_name else '',
         })
-    items.sort(key=lambda item: (item['created_ts'], item['snapshot']), reverse=True)
+    items.sort(key=lambda item: (item['created_ts'], item['seq']), reverse=True)
     return items
+
+
+def _snapshot_present(folder: Path, name: str) -> bool:
+    """快照是否已经存在（本机文件或 iCloud 占位文件都算）。"""
+    if not name:
+        return False
+    return ((folder / name).is_file()
+            or (folder / f'.{name}.icloud').is_file())
 
 
 def _unique_snapshot_name(folder: Path, kind: str = KIND_MANUAL) -> str:
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     tag = _device_tag()
-    name = f'{SNAPSHOT_PREFIX}{stamp}_{tag}_{kind}{SNAPSHOT_SUFFIX}'
-    index = 2
-    while (folder / name).exists():
-        name = f'{SNAPSHOT_PREFIX}{stamp}_{tag}_{kind}_{index}{SNAPSHOT_SUFFIX}'
-        index += 1
-    return name
+    prefix = f'{SNAPSHOT_PREFIX}{stamp}_{tag}_{kind}'
+    # 同一秒内不复用基础名：已有同秒快照时顺延序号，否则清理后重建会用回
+    # `_auto.db`，按文件名排序时会被误认为最早的一份。
+    max_seq = 0
+    for name, _path, _stub in _iter_snapshot_files(folder):
+        info = _snapshot_info(name)
+        if not info or info['tag'] != tag or info['kind'] != kind:
+            continue
+        if info['snapshot'].startswith(prefix):
+            max_seq = max(max_seq, info['seq'])
+    index = max_seq + 1
+    if index <= 1:
+        return f'{prefix}{SNAPSHOT_SUFFIX}'
+    return f'{prefix}_{index}{SNAPSHOT_SUFFIX}'
+
+
+def _embed_ios_explore_sites(conn: sqlite3.Connection) -> None:
+    """把桌面探索空间站点同时写成 iOS 可识别的 ios_explore_sites。"""
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key='explore_sites'"
+        ).fetchone()
+        if not row or not row[0]:
+            return
+        payload = explore.to_ios_payload(json.loads(row[0]))
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES('ios_explore_sites', ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (payload,),
+        )
+    except (sqlite3.Error, ValueError):
+        pass
+
+
+def _mark_marks_authoritative(conn: sqlite3.Connection) -> None:
+    """标记这份快照完整维护换源忽略与彻底删除墓碑。
+
+    桌面端与 iOS v1.3+ 都会把两张表写进快照；标记用于区分「表为空是用户
+    真的清空了」和「老 iOS 快照根本不写这两张表」，避免恢复时误保留旧标记。
+    """
+    try:
+        conn.execute(
+            "INSERT INTO settings(key, value) VALUES(?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (SETTING_MARKS_VERSION, MARKS_VERSION),
+        )
+    except sqlite3.Error:
+        pass
+
+
+def _strip_snapshot_meta(db) -> None:
+    """清除只属于快照的元数据，避免落到本机设置里。"""
+    try:
+        db.delete_setting(SETTING_MARKS_VERSION)
+    except sqlite3.Error:
+        pass
+
+
+def _restore_ios_compatibility(db, snapshot_path: Path) -> None:
+    """兼容 iOS 快照：回填探索空间站点，并从 sidecar 导入影片时长。"""
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            if not conn.execute(
+                    "SELECT 1 FROM settings WHERE key='explore_sites'").fetchone():
+                row = conn.execute(
+                    "SELECT value FROM settings WHERE key='ios_explore_sites'"
+                ).fetchone()
+                sites = explore.from_ios_payload(row[0]) if row and row[0] else []
+                if sites:
+                    state = {'version': 3, 'last_source': 'iOS 快照',
+                             'pulled_at': '', 'sites': sites}
+                    conn.execute(
+                        "INSERT INTO settings(key, value) VALUES('explore_sites', ?)"
+                        " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (json.dumps(state, ensure_ascii=False),),
+                    )
+                    conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
+
+    sidecar = snapshot_path.with_name(snapshot_path.name + '.ios.json')
+    if not sidecar.is_file():
+        return
+    try:
+        data = json.loads(sidecar.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    durations = []
+    for record in data.get('records') or []:
+        if not isinstance(record, dict) or record.get('mediaType') != 'movie':
+            continue
+        subject_id = record.get('subjectID')
+        minutes = record.get('durationMinutes')
+        if subject_id and minutes:
+            durations.append((subject_id, minutes))
+    if durations:
+        import_movie_durations(durations)
+
+
+def _collect_sidecar(conn: sqlite3.Connection) -> dict:
+    """收集 iOS 侧车需要的数据：影视时长、书籍页数、自定义封面。"""
+    pages = {str(row[0]): int(row[1] or 0)
+             for row in conn.execute('SELECT subject_id, pages FROM book_meta')}
+    entries = []
+    try:
+        rows = conn.execute(
+            "SELECT media_type, subject_id, status, cover_path, cover_url"
+            " FROM records WHERE deleted_at='' ORDER BY id"
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for record in rows:
+        media_type, subject_id, status, cover_path, cover_url = record
+        media_type = str(media_type)
+        subject_id = str(subject_id)
+        cover_path = cover_path or ''
+        cover_url = cover_url or ''
+        entry = {
+            'mediaType': media_type,
+            'subjectID': subject_id,
+            'status': status or 'done',
+        }
+        if media_type == 'movie':
+            minutes = movie_duration(subject_id)
+            if minutes:
+                entry['durationMinutes'] = int(minutes)
+        elif pages.get(subject_id):
+            entry['pages'] = pages[subject_id]
+        if cover_url:
+            entry['coverURL'] = cover_url
+        if is_custom_cover(media_type, subject_id, cover_path):
+            data = read_cover_base64(media_type, subject_id, cover_path)
+            if data:
+                entry['coverSource'] = 'link'
+                entry['coverData'] = data
+        elif cover_url:
+            entry['coverSource'] = 'douban'
+        entries.append(entry)
+    return {'version': 1, 'records': entries,
+            'doulistItems': _collect_sidecar_doulist_items(conn)}
+
+
+# iOS 侧车用「2001-01-01 UTC 起的秒数」表示时间（Swift Date 默认编码）。
+SIDECAR_EPOCH = datetime(2001, 1, 1, tzinfo=timezone.utc)
+
+
+UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}'
+                      r'-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
+
+
+def _is_local_doulist_id(douban_id: str) -> bool:
+    """iOS 把 `ios-local-<UUID>`、裸 UUID 和空值都当成「本地豆列」。"""
+    value = (douban_id or '').strip()
+    return (not value) or value.startswith('ios-local-') or bool(UUID_RE.match(value))
+
+
+def _sidecar_list_key(media_type: str, douban_id: str, title: str) -> str:
+    """与 iOS `sidecarListKey` 保持一致：真实豆瓣 ID 用 `douban:`，本地豆列按类型+标题。"""
+    if not _is_local_doulist_id(douban_id):
+        return f'douban:{(douban_id or "").strip()}'
+    normalized = ' '.join((title or '').split())
+    return f'local:{media_type}:{normalized}'
+
+
+def _to_sidecar_date(text: str) -> Optional[float]:
+    try:
+        moment = datetime.strptime((text or '').strip(), '%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return None
+    return (moment.astimezone() - SIDECAR_EPOCH).total_seconds()
+
+
+def _from_sidecar_date(value) -> str:
+    """iOS 当前用 Swift Date 默认编码（2001 起秒数）；也兼容文档里的 ISO 字符串。"""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ''
+        try:
+            moment = datetime.fromisoformat(text.replace('Z', '+00:00'))
+        except ValueError:
+            return ''
+        return moment.astimezone().strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return ''
+    return (SIDECAR_EPOCH + timedelta(seconds=seconds)).astimezone().strftime('%Y-%m-%d %H:%M:%S')
+
+
+def _collect_sidecar_doulist_items(conn: sqlite3.Connection) -> list[dict]:
+    """豆列条目的展示字段不在桌面 schema 里时也能跨端保留（与 iOS 侧车同名）。"""
+    keys = {}
+    for row in conn.execute('SELECT id, media_type, douban_id, title FROM doulists'):
+        keys[int(row[0])] = _sidecar_list_key(str(row[1]), str(row[2] or ''), str(row[3] or ''))
+    if not keys:
+        return []
+    items = []
+    for row in conn.execute(
+        'SELECT doulist_id, media_type, subject_id, duration_minutes, pages,'
+        ' word_count, year, release_date, rating, comment, intro, create_time'
+        ' FROM doulist_items ORDER BY doulist_id, position, id'
+    ):
+        list_key = keys.get(int(row[0]))
+        if not list_key:
+            continue
+        entry = {'listKey': list_key, 'mediaType': str(row[1]),
+                 'subjectID': str(row[2])}
+        for index, name in ((3, 'durationMinutes'), (4, 'pages'), (5, 'wordCount')):
+            value = int(row[index] or 0)
+            if value:
+                entry[name] = value
+        for index, name in ((6, 'year'), (7, 'releaseDate')):
+            value = str(row[index] or '').strip()
+            if value:
+                entry[name] = value
+        rating = int(row[8] or 0)
+        if rating:
+            entry['rating'] = rating
+        for index, name in ((9, 'comment'), (10, 'intro')):
+            value = str(row[index] or '')
+            if value:
+                entry[name] = value
+        created = _to_sidecar_date(str(row[11] or ''))
+        if created:
+            entry['createdAt'] = created
+        items.append(entry)
+    return items
+
+
+def _write_sidecar(snapshot_path: Path, payload: dict) -> None:
+    sidecar = snapshot_path.with_name(snapshot_path.name + '.ios.json')
+    temp = sidecar.with_name(f'.{sidecar.name}.part')
+    try:
+        temp.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        os.replace(temp, sidecar)
+    except OSError:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _apply_sidecar_covers(db, snapshot_path: Path) -> int:
+    """用 sidecar 里的自定义封面覆盖本地封面文件与记录路径。"""
+    sidecar = snapshot_path.with_name(snapshot_path.name + '.ios.json')
+    if not sidecar.is_file():
+        return 0
+    try:
+        data = json.loads(sidecar.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return 0
+    covers = {}
+    for record in data.get('records') or []:
+        if not isinstance(record, dict) or record.get('coverSource') != 'link':
+            continue
+        media_type = record.get('mediaType')
+        subject_id = record.get('subjectID')
+        payload = record.get('coverData')
+        if media_type not in ('movie', 'book') or not subject_id or not payload:
+            continue
+        path = save_cover_base64(media_type, subject_id, payload)
+        if path:
+            covers[(media_type, str(subject_id))] = path
+    if not covers:
+        return 0
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            for (media_type, subject_id), path in covers.items():
+                conn.execute(
+                    "UPDATE records SET cover_path=? WHERE media_type=? AND subject_id=?",
+                    (path, media_type, subject_id))
+                conn.execute(
+                    "UPDATE doulist_items SET cover_path=? WHERE media_type=? AND subject_id=?",
+                    (path, media_type, subject_id))
+                conn.execute(
+                    "UPDATE plan_items SET cover_path=? WHERE media_type=? AND subject_id=?",
+                    (path, media_type, subject_id))
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    return len(covers)
+
+
+def _snapshot_marks_authoritative(conn: sqlite3.Connection) -> bool:
+    """快照是否声明自己完整维护 ignored_subjects / purged_records。"""
+    try:
+        row = conn.execute(
+            'SELECT value FROM settings WHERE key=?', (SETTING_MARKS_VERSION,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row and str(row[0]).strip() == MARKS_VERSION)
+
+
+SIDECAR_ITEM_FIELDS = (
+    ('durationMinutes', 'duration_minutes', int),
+    ('pages', 'pages', int),
+    ('wordCount', 'word_count', int),
+    ('year', 'year', str),
+    ('releaseDate', 'release_date', str),
+    ('rating', 'rating', int),
+    ('comment', 'comment', str),
+    ('intro', 'intro', str),
+)
+
+
+def _apply_sidecar_doulist_items(db, snapshot_path: Path) -> int:
+    """把 iOS 侧车里的豆列条目展示字段写回本机（桌面 schema 不全都有这些列）。"""
+    sidecar = snapshot_path.with_name(snapshot_path.name + '.ios.json')
+    if not sidecar.is_file():
+        return 0
+    try:
+        data = json.loads(sidecar.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return 0
+    items = data.get('doulistItems')
+    if not isinstance(items, list) or not items:
+        return 0
+    updated = 0
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            keys = {}
+            for row in conn.execute('SELECT id, media_type, douban_id, title FROM doulists'):
+                raw_id = str(row[2] or '')
+                canonical = _sidecar_list_key(str(row[1]), raw_id, str(row[3] or ''))
+                keys[canonical] = int(row[0])
+                # 兼容早期桌面端写出的 `douban:ios-local-…` / `douban:<UUID>` 写法。
+                legacy = f'douban:{raw_id.strip()}'
+                if raw_id.strip() and legacy != canonical:
+                    keys.setdefault(legacy, int(row[0]))
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                doulist_id = keys.get(str(item.get('listKey') or ''))
+                media_type = str(item.get('mediaType') or '')
+                subject_id = str(item.get('subjectID') or '')
+                if not doulist_id or not media_type or not subject_id:
+                    continue
+                assignments, values = [], []
+                for source, column, cast in SIDECAR_ITEM_FIELDS:
+                    if item.get(source) is None:
+                        continue
+                    try:
+                        values.append(cast(item[source]))
+                    except (TypeError, ValueError):
+                        continue
+                    assignments.append(f'{column}=?')
+                if item.get('createdAt') is not None:
+                    created = _from_sidecar_date(item.get('createdAt'))
+                    if created:
+                        assignments.append('create_time=?')
+                        values.append(created)
+                if not assignments:
+                    continue
+                cursor = conn.execute(
+                    f'UPDATE doulist_items SET {", ".join(assignments)}'
+                    ' WHERE doulist_id=? AND media_type=? AND subject_id=?',
+                    (*values, doulist_id, media_type, subject_id),
+                )
+                updated += int(cursor.rowcount or 0)
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    return updated
+
+
+def _preserve_ios_markers(db, snapshot_path: Path, local_backup: Path) -> None:
+    """老 iOS 快照不维护 ignored_subjects / purged_records。
+
+    这类快照里两张表为空，并不代表用户主动清空了标记；恢复时保留本机原有的
+    换源忽略与彻底删除墓碑，避免豆瓣同步把旧条目/已删条目重新加回来。
+
+    带 `snapshot_marks_version` 标记的快照（桌面端与 iOS v1.3+）写全了两张表，
+    空表就是真的清空，按快照覆盖即可。
+    """
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            if _snapshot_marks_authoritative(conn):
+                return
+            ios_like = snapshot_path.with_name(snapshot_path.name + '.ios.json').is_file()
+            if not ios_like:
+                row = conn.execute(
+                    "SELECT 1 FROM settings WHERE key='ios_explore_sites'").fetchone()
+                ios_like = bool(row)
+            if not ios_like:
+                return
+            counts = [conn.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0]
+                      for table in ('ignored_subjects', 'purged_records')]
+            if any(counts):
+                return
+            conn.execute('ATTACH DATABASE ? AS olddb', (str(local_backup),))
+            try:
+                conn.execute(
+                    'INSERT OR IGNORE INTO ignored_subjects'
+                    ' SELECT media_type, subject_id, created_at FROM olddb.ignored_subjects')
+                conn.execute(
+                    'INSERT OR IGNORE INTO purged_records'
+                    ' SELECT media_type, subject_id, status, title, purged_at'
+                    ' FROM olddb.purged_records')
+                conn.commit()
+            finally:
+                try:
+                    conn.execute('DETACH DATABASE olddb')
+                except sqlite3.Error:
+                    pass
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        pass
 
 
 def create_snapshot(db, force: bool = False, kind: str = KIND_MANUAL) -> dict:
@@ -350,7 +883,9 @@ def create_snapshot(db, force: bool = False, kind: str = KIND_MANUAL) -> dict:
     current_state = state_id(db.path)
     if not force and db.get_setting(SETTING_LAST_STATE) == current_state:
         latest = load_manifest(folder)
-        if latest and (folder / latest['snapshot']).is_file():
+        # 最新快照被 iCloud 驱逐、只剩占位文件时也算已备份：这里若重做一份会把
+        # 清单指向本机旧数据，其他设备下次同步就会把这份旧的当成「最新」。
+        if latest and _snapshot_present(folder, latest.get('snapshot') or ''):
             return {
                 'skipped': True,
                 'folder': str(folder),
@@ -370,12 +905,15 @@ def create_snapshot(db, force: bool = False, kind: str = KIND_MANUAL) -> dict:
         target.execute(
             f'DELETE FROM settings WHERE key IN ({placeholders})', LOCAL_SETTING_KEYS
         )
+        _embed_ios_explore_sites(target)
+        _mark_marks_authoritative(target)
         target.commit()
         counts = _counts(target)
         media = _media_counts(target)
         counts['records_movie'] = media['movie']
         counts['records_book'] = media['book']
         last_updated = _records_updated(target)
+        sidecar = _collect_sidecar(target)
     finally:
         target.close()
         source.close()
@@ -383,13 +921,18 @@ def create_snapshot(db, force: bool = False, kind: str = KIND_MANUAL) -> dict:
     try:
         sha256 = _sha256_file(temp)
         os.replace(temp, final)
+        _write_sidecar(final, sidecar)
     except OSError as exc:
         temp.unlink(missing_ok=True)
         raise SyncError(f'写入快照失败：{exc}') from exc
 
+    profile = device_profile()
     manifest = {
         'snapshot': name,
         'created_at': _now_text(),
+        'tag': profile['tag'],
+        'platform': profile['platform'],
+        'arch': profile['arch'],
         'created_ts': int(time.time()),
         'device': platform.node() or '未知设备',
         'app_version': APP_VERSION,
@@ -400,6 +943,7 @@ def create_snapshot(db, force: bool = False, kind: str = KIND_MANUAL) -> dict:
         'kind': kind,
     }
     _write_manifest(folder, manifest)
+    _remember_device(folder)
     _prune_snapshots(folder)
 
     db.set_setting(SETTING_LAST_STATE, current_state)
@@ -519,6 +1063,11 @@ def restore_snapshot(db, manifest: Optional[dict] = None) -> dict:
         if value:
             db.set_setting(key, value)
     sync_book_pages(db)
+    _restore_ios_compatibility(db, path)
+    _apply_sidecar_covers(db, path)
+    _apply_sidecar_doulist_items(db, path)
+    _preserve_ios_markers(db, path, local_backup)
+    _strip_snapshot_meta(db)
     state = state_id(db.path)
     db.set_setting(SETTING_LAST_STATE, state)
     db.set_setting(SETTING_LAST_TIME, _now_text())

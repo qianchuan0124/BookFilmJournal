@@ -88,7 +88,7 @@ class DoubanLoginDialog(QDialog):
             self.use_button.setEnabled(True)
             uid_text = f'，用户 ID：{self.user_id}' if self.user_id else ''
             self.status_label.setText(f'已识别到豆瓣登录 Cookie{uid_text}，可以点击右侧「使用此登录」。')
-            self.status_label.setStyleSheet('color:#7fae68;')
+            self.status_label.setTextColor('#4f7d3a', '#7fae68')
 
     def _accept_cookie(self) -> None:
         if not self.cookies:

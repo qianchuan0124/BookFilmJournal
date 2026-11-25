@@ -15,6 +15,7 @@ from app.ui.report_page import ReportPage
 from app.ui.plan_page import PlanPage
 from app.ui.data_page import DataPage
 from app.ui.recycle_page import RecyclePage
+from app.ui.explore_page import ExplorePage
 
 
 class MainWindow(FluentWindow):
@@ -33,6 +34,7 @@ class MainWindow(FluentWindow):
         self.report_page = ReportPage(self.db, self)
         self.data_page = DataPage(self.db, self)
         self.recycle_page = RecyclePage(self.db, self)
+        self.explore_page = ExplorePage(self.db, self)
 
         for page, icon, text in (
             (self.movie_page, FluentIcon.MOVIE, '观影记录'),
@@ -40,6 +42,7 @@ class MainWindow(FluentWindow):
             (self.doulist_page, FluentIcon.ALBUM, '我的豆列'),
             (self.plan_page, FluentIcon.CALENDAR, '我的计划'),
             (self.report_page, FluentIcon.DOCUMENT, '报告中心'),
+            (self.explore_page, FluentIcon.GLOBE, '探索空间'),
             (self.data_page, FluentIcon.SETTING, '应用设置'),
             (self.recycle_page, FluentIcon.DELETE, '回收站'),
         ):
