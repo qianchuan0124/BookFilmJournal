@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "id": "github",
+      "name": "GitHub",
+      "url": "https://raw.githubusercontent.com/catnine/bookfilm-sites/main/sites.json"
+    },
+    {
+      "id": "gitee",
+      "name": "Gitee",
+      "url": "https://gitee.com/catnine/bookfilm-sites/raw/main/sites.json"
+    }
+  ]
+}

@@ -4,12 +4,12 @@
     {
       "id": "github",
       "name": "GitHub",
-      "url": "https://raw.githubusercontent.com/catnine/bookfilm-sites/main/sites.json"
+      "url": "https://github.com/qianchuan0124/BookFilmJournal/releases/download/v0.1.1/sites.json"
     },
     {
       "id": "gitee",
       "name": "Gitee",
-      "url": "https://gitee.com/catnine/bookfilm-sites/raw/main/sites.json"
+      "url": "https://gitee.com/qian_chuan/book-film-journal/releases/download/v0.1.0/sites.json"
     }
   ]
 }
