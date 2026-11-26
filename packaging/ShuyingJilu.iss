@@ -1,10 +1,10 @@
 ; 书影记录 Windows 安装包（Inno Setup 6）
 ; 由 packaging\build_windows.bat 调用：
-;   ISCC.exe /DMyAppVersion=0.1.0 packaging\ShuyingJilu.iss
+;   ISCC.exe /DMyAppVersion=0.1.1 packaging\ShuyingJilu.iss
 ; 编译前需先执行 PyInstaller，确保 dist\ShuyingJilu\ShuyingJilu.exe 已生成。
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.0"
+  #define MyAppVersion "0.1.1"
 #endif
 
 #define MyAppName "书影记录"

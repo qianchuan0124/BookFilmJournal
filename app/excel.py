@@ -7,7 +7,8 @@ from typing import Optional
 
 from app.db import Database
 from app.media_meta import (
-    book_pages, movie_duration, parse_duration, set_book_pages, set_movie_duration,
+    book_pages, movie_duration, parse_duration, seed_from_doulist_items,
+    set_book_pages, set_movie_duration,
 )
 
 RECORD_HEADERS = [
@@ -402,7 +403,7 @@ def _apply_metadata(records: list[dict], db: Database) -> None:
             continue
         seen.add(key)
         if record['media_type'] == 'movie' and record.get('_duration'):
-            set_movie_duration(record['subject_id'], record['_duration'])
+            set_movie_duration(record['subject_id'], record['_duration'], db=db)
         elif record['media_type'] == 'book' and record.get('_pages'):
             set_book_pages(record['subject_id'], record['_pages'], db=db)
 
@@ -673,6 +674,10 @@ def import_excel(db: Database, path: str) -> dict:
                 stats['ignored_subjects'] += 1
     finally:
         workbook.close()
+    # 计划/豆列条目可能只有条目 ID，没有封面地址；从同条目记录里补齐。
+    db.fill_item_covers_from_records()
+    # 豆列条目自带时长/页数时补进本机元数据，导入后不必再联网补全。
+    seed_from_doulist_items(db)
     return stats
 
 

@@ -300,6 +300,8 @@ class RecordsPage(QWidget):
         if self._add_cards(view, self._BATCH_CARDS):
             self._schedule_pump(view)
             return
+        # 卡片都建完了，撤掉加载期间锁定的最小高度，否则排布变宽/变窄后可能永久留白。
+        self.container.setMinimumHeight(0)
         self._restore_scroll_if_needed()
         self._schedule_warmup()
 
@@ -576,8 +578,12 @@ class RecordsPage(QWidget):
             self.content_layout.invalidate()
             self.content_layout.activate()
             # 分批补卡时滚动区会先按旧内容高度压缩分组，卡片看起来在慢慢变高。
-            # 这里同步把容器最小高度更新为最新内容高度，避免被压缩。
-            self.container.setMinimumHeight(self.content_layout.sizeHint().height())
+            # 加载期间才锁定最小高度；全部建完后必须放开，否则中途算大的高度会一直留着，
+            # 表现为列表底部一大片空白。
+            pending = any(entry['total'] > len(entry['cards'])
+                          for entry in view['pending'])
+            self.container.setMinimumHeight(
+                self.content_layout.sizeHint().height() if pending else 0)
         except RuntimeError:
             pass
 

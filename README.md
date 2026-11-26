@@ -2,7 +2,7 @@
   <img src="./docs/images/icon-rounded.png" width="96" alt="书影记录">
   <h1>书影记录</h1>
   <p>把豆瓣上的观影与阅读，整理成一座属于自己的私人档案馆。</p>
-  <p><code>v0.1.0</code> · Python 3.13 · PySide6 · QFluentWidgets · SQLite</p>
+  <p><code>v0.1.1</code> · Python 3.13 · PySide6 · QFluentWidgets · SQLite</p>
 </div>
 
 **书影记录** 是一个基于 **QFluentWidgets + PySide6** 的豆瓣书影音本地管理工具：把观影/读书记录、想看/想读、豆列和计划同步到本地 SQLite，按本地生效日期浏览，并生成可归档的 HTML / PNG 报告。
@@ -72,6 +72,18 @@
 <img src="./docs/images/guide-report.png" width="860" alt="报告中心">
 
 按月、年、自定义范围或全部记录生成报告，支持暗色/亮色主题与 PNG 导出。
+
+### 探索空间
+
+<img src="./docs/images/guide-explore.png" width="860" alt="探索空间">
+
+资源站点由远端配置下发（GitHub 失败自动回退 Gitee），也可以添加自己的本地站点；支持一键拉取配置并保留手动调整的顺序、上下移动排序、连通性检测（Cloudflare 人机校验页按可达处理），点击站点复制链接。
+
+<img src="./docs/images/guide-explore-2.png" width="860" alt="记录详情 · 站点跳转">
+
+配置好站点后，观影/读书记录详情右侧会出现「资源」按钮：点一下就用当前片名/书名在该站点打开搜索页，不用再复制标题去别的网站；按钮前的符号是上次连通性检测结果。
+
+站点清单由远端 `sites.json` 下发，格式示例见 [`docs/探索空间配置示例.json`](docs/探索空间配置示例.json)（`movie` / `book` 两个数组，`searchUrl` 用 `{title}` 占位）；配置源地址在 [`config/explore_sources.json`](config/explore_sources.json)（先试 GitHub，失败回退 Gitee）。
 
 ### 应用设置
 
@@ -219,10 +231,12 @@ python -m compileall app main.py
 .venv/bin/ruff check app main.py --select F
 ```
 
-功能展示图片由脚本生成，读取 `GUIDE_PREVIEW_DIR`（默认 `~/Desktop/preview`）下的界面截图，
+功能展示图片由脚本生成，读取 `GUIDE_PREVIEW_DIR`（默认仓库内 `docs/images/`，缺图的任务会自动跳过）下的界面截图，
 自动加蒙层、挖空高亮与气泡，并对本地路径、豆瓣 ID 做模糊处理：
 
 ```bash
+.venv/bin/python tools/make_guide_images.py
+# 也可指向自己的截图目录
 GUIDE_PREVIEW_DIR=~/Desktop/preview .venv/bin/python tools/make_guide_images.py
 ```
 
@@ -283,6 +297,18 @@ GUIDE_PREVIEW_DIR=~/Desktop/preview .venv/bin/python tools/make_guide_images.py
 ```
 
 ## 📝 更新日志
+
+### v0.1.1
+
+**需求：探索空间** —— 站点清单由云端配置下发（GitHub 失败自动回退 Gitee），一键拉取时保留手动调整过的顺序；支持新增/编辑本地站点、上下移动排序、点击整行复制链接；连通性检测把 Cloudflare 人机校验页按可达处理，圆点直接显示每个站点的状态；记录详情里还能按标题一键跳转到各站点搜索。新增引导图见上文「探索空间」。
+
+其他改进：
+
+- 云同步协议对齐 iOS v1.3：`movie_meta` 影片时长表、`snapshot_marks_version` 标记、真实豆瓣豆列 ID、设备清单 `devices.json`、同秒序号与未下载占位；恢复时读取侧车 `coverURL` / `pages` / `planItems`，封面地址、页数、时长不再重复联网补全。
+- 补全链路：恢复后用本机备份回填封面、豆列/计划从记录借封面、豆列条目自带的时长与页数直接补种，减少大量无效抓取。
+- Excel 备份：豆列条目新增状态/时长/页数/字数/年份/上映日期，计划条目新增状态/上映日期；覆盖回收站 5 张表与「换源忽略」「彻底删除」标记。
+- 应用设置：云同步卡片文案精简为「一句说明 + 一行状态 + 两个开关说明」，补全进度改用悬浮提示与进度条。
+- 界面修复：记录列表底部长空白（加载时锁定的最小高度未释放）；亮色主题下豆列、详情、计划、设置等多处文字对比度。
 
 ### v0.1.0
 

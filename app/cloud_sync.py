@@ -20,9 +20,12 @@ from pathlib import Path
 from typing import Optional
 
 from app import explore
-from app.config import APP_VERSION, DB_PATH
+from app.config import APP_VERSION, COVERS_DIR, DB_PATH, ROOT
 from app.cover_sync import is_custom_cover, read_cover_base64, save_cover_base64
-from app.media_meta import import_movie_durations, movie_duration, sync_book_pages
+from app.media_meta import (
+    import_movie_durations, movie_duration, parse_duration, persist_movie_durations,
+    seed_from_doulist_items, sync_book_pages, sync_movie_durations,
+)
 
 SYNC_SUBDIR = '书影记录'
 DEVICES_NAME = 'devices.json'
@@ -43,7 +46,7 @@ LOCAL_BACKUP_KEEP = 5
 
 COUNT_TABLES = (
     'records', 'doulists', 'doulist_items', 'plan_folders', 'plan_items',
-    'book_words', 'book_meta', 'ignored_subjects', 'purged_records',
+    'book_words', 'book_meta', 'movie_meta', 'ignored_subjects', 'purged_records',
 )
 
 # 只属于当前设备的设置：不写进快照，恢复时保留本机值。
@@ -56,8 +59,16 @@ LOCAL_SETTING_KEYS = (
     'cloud_sync_last_snapshot',
     'cloud_sync_auto_backup',
     'cloud_sync_auto_sync',
+    'sync_mode',
+    'theme',
+    'report_theme',
+    'display_avatar',
 )
-PRESERVE_ON_RESTORE = ('douban_cookie', 'book_library_dir', 'cloud_sync_dir')
+# 恢复时会用本机值覆盖回去：这些一旦丢了两端都不好恢复，或纯属本机偏好。
+PRESERVE_ON_RESTORE = (
+    'douban_cookie', 'book_library_dir', 'cloud_sync_dir',
+    'sync_mode', 'theme', 'report_theme', 'display_avatar',
+)
 
 SETTING_DIR = 'cloud_sync_dir'
 SETTING_LAST_STATE = 'cloud_sync_last_state'
@@ -463,6 +474,54 @@ def _unique_snapshot_name(folder: Path, kind: str = KIND_MANUAL) -> str:
     return f'{prefix}_{index}{SNAPSHOT_SUFFIX}'
 
 
+def _write_movie_meta(conn: sqlite3.Connection) -> None:
+    """把本机缓存里的影片时长写进快照（数据库表 movie_meta 随快照跨设备同步）。"""
+    try:
+        import app.media_meta as media_meta
+        entries = {entry['subject_id']: entry
+                   for entry in media_meta.cached_movie_duration_entries()}
+    except Exception:  # noqa: BLE001 - 元数据缓存异常不影响快照
+        return
+    # 缓存里没有、但记录简介能解析出片长的（如「片长: 122分钟」）也一并写进快照，
+    # 这样即使没跑过豆瓣补全，换设备恢复后也不会再逐条重拉。
+    try:
+        rows = conn.execute(
+            "SELECT subject_id, intro FROM records WHERE media_type='movie'"
+        ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    for row in rows:
+        subject_id = str(row[0])
+        if subject_id in entries:
+            continue
+        minutes = parse_duration(str(row[1] or ''))
+        if minutes:
+            entries[subject_id] = {'subject_id': subject_id,
+                                   'duration_minutes': int(minutes),
+                                   'duration_manual': False}
+    if not entries:
+        return
+    try:
+        conn.executemany(
+            'INSERT INTO movie_meta'
+            ' (subject_id, duration_minutes, duration_manual, updated_at)'
+            ' VALUES (?, ?, ?, ?)'
+            ' ON CONFLICT(subject_id) DO UPDATE SET'
+            '   duration_minutes=CASE WHEN movie_meta.duration_manual=1'
+            '     AND excluded.duration_manual=0 THEN movie_meta.duration_minutes'
+            '     ELSE excluded.duration_minutes END,'
+            '   duration_manual=CASE WHEN movie_meta.duration_manual=1'
+            '     THEN 1 ELSE excluded.duration_manual END,'
+            '   updated_at=excluded.updated_at',
+            [(entry['subject_id'], entry['duration_minutes'],
+              1 if entry['duration_manual'] else 0, _now_text())
+             for entry in entries.values()],
+        )
+        conn.commit()
+    except sqlite3.Error:
+        pass
+
+
 def _embed_ios_explore_sites(conn: sqlite3.Connection) -> None:
     """把桌面探索空间站点同时写成 iOS 可识别的 ios_explore_sites。"""
     try:
@@ -538,15 +597,87 @@ def _restore_ios_compatibility(db, snapshot_path: Path) -> None:
     except (OSError, ValueError):
         return
     durations = []
+    covers = []
+    pages = []
     for record in data.get('records') or []:
-        if not isinstance(record, dict) or record.get('mediaType') != 'movie':
+        if not isinstance(record, dict):
             continue
+        media_type = record.get('mediaType')
         subject_id = record.get('subjectID')
+        if media_type not in ('movie', 'book') or not subject_id:
+            continue
+        subject_id = str(subject_id)
         minutes = record.get('durationMinutes')
-        if subject_id and minutes:
+        if media_type == 'movie' and minutes:
             durations.append((subject_id, minutes))
+        cover_url = str(record.get('coverURL') or '').strip()
+        if cover_url:
+            covers.append((media_type, subject_id, cover_url))
+        page_count = record.get('pages')
+        if media_type == 'book' and page_count:
+            pages.append((subject_id, int(page_count)))
     if durations:
         import_movie_durations(durations)
+    if covers:
+        _apply_sidecar_cover_urls(db, covers)
+    if pages:
+        _apply_sidecar_pages(db, pages)
+
+
+def _apply_sidecar_cover_urls(db, covers) -> int:
+    """iOS 快照的 records.cover_url 为空，但侧车带原始封面地址：补回库里。
+
+    有地址之后补全逻辑就能直接下载封面，不必再逐条解析豆瓣详情页。
+    """
+    updated = 0
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            for media_type, subject_id, cover_url in covers:
+                cursor = conn.execute(
+                    "UPDATE records SET cover_url=? WHERE media_type=? AND subject_id=?"
+                    " AND cover_url=''",
+                    (cover_url, media_type, subject_id),
+                )
+                updated += int(cursor.rowcount or 0)
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    return updated
+
+
+def _apply_sidecar_pages(db, pages) -> int:
+    """老 iOS 快照的 book_meta 可能为空；侧车里有页数时补一条非手动值。"""
+    updated = 0
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            for subject_id, page_count in pages:
+                row = conn.execute(
+                    'SELECT pages, pages_manual FROM book_meta WHERE subject_id=?',
+                    (str(subject_id),),
+                ).fetchone()
+                if row and (int(row[0] or 0) > 0 or row[1]):
+                    continue
+                conn.execute(
+                    'INSERT INTO book_meta(subject_id, pages, pages_manual, updated_at)'
+                    ' VALUES (?, ?, 0, ?)'
+                    ' ON CONFLICT(subject_id) DO UPDATE SET'
+                    ' pages=CASE WHEN book_meta.pages_manual=1 THEN book_meta.pages'
+                    '   ELSE excluded.pages END',
+                    (str(subject_id), int(page_count), _now_text()),
+                )
+                updated += 1
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    if updated:
+        sync_book_pages(db)
+    return updated
 
 
 def _collect_sidecar(conn: sqlite3.Connection) -> dict:
@@ -737,6 +868,102 @@ def _apply_sidecar_covers(db, snapshot_path: Path) -> int:
     return len(covers)
 
 
+COVER_TABLES = ('records', 'doulist_items', 'plan_items')
+
+
+def _cover_file_ok(path_text: str) -> bool:
+    text = (path_text or '').strip()
+    if not text:
+        return False
+    path = Path(text)
+    if not path.is_absolute():
+        path = ROOT / path
+    try:
+        return path.is_file() and path.stat().st_size > 500
+    except OSError:
+        return False
+
+
+def _merge_local_covers(db, local_backup: Path) -> int:
+    """快照不带本机封面缓存；恢复后把本机原有的封面路径/URL 补回仍为空的条目。
+
+    iOS 快照里 `cover_path` / `cover_url` 都是空值，直接整库覆盖会让本机已经下载好
+    的豆瓣封面和自定义封面「消失」，直到重新补全。这里从恢复前的本机备份里回填：
+    - 封面 URL 为空时补 URL（供后续补全下载用）；
+    - 封面路径为空或文件已不存在时，用本机仍存在的旧路径。
+    """
+    old: dict[tuple[str, str, str], tuple[str, str]] = {}
+    try:
+        source = sqlite3.connect(str(local_backup))
+        try:
+            source.row_factory = sqlite3.Row
+            for table in COVER_TABLES:
+                try:
+                    rows = source.execute(
+                        f'SELECT media_type, subject_id, cover_url, cover_path FROM {table}'
+                    ).fetchall()
+                except sqlite3.Error:
+                    continue
+                for row in rows:
+                    key = (table, str(row['media_type']), str(row['subject_id']))
+                    old.setdefault(key, (row['cover_url'] or '', row['cover_path'] or ''))
+        finally:
+            source.close()
+    except sqlite3.Error:
+        return 0
+    if not old:
+        return 0
+
+    updated = 0
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            conn.row_factory = sqlite3.Row
+            for table in COVER_TABLES:
+                try:
+                    rows = conn.execute(
+                        f'SELECT id, media_type, subject_id, cover_url, cover_path FROM {table}'
+                    ).fetchall()
+                except sqlite3.Error:
+                    continue
+                for row in rows:
+                    key = (table, str(row['media_type']), str(row['subject_id']))
+                    old_url, old_path = old.get(key, ('', ''))
+                    if not old_url and not old_path:
+                        continue
+                    new_url = row['cover_url'] or ''
+                    new_path = row['cover_path'] or ''
+                    changed = False
+                    if not new_url and old_url:
+                        new_url = old_url
+                        changed = True
+                    if not _cover_file_ok(new_path) and _cover_file_ok(old_path):
+                        new_path = old_path
+                        changed = True
+                    if not _cover_file_ok(new_path):
+                        # 最后兜底：本机缓存目录里已有标准命名的豆瓣封面。
+                        fallback = COVERS_DIR / f"{row['media_type']}_{row['subject_id']}.jpg"
+                        if _cover_file_ok(str(fallback)):
+                            try:
+                                new_path = str(fallback.relative_to(ROOT))
+                            except ValueError:
+                                new_path = str(fallback)
+                            changed = True
+                    if not changed:
+                        continue
+                    conn.execute(
+                        f'UPDATE {table} SET cover_url=?, cover_path=? WHERE id=?',
+                        (new_url, new_path, row['id']),
+                    )
+                    updated += 1
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    return updated
+
+
 def _snapshot_marks_authoritative(conn: sqlite3.Connection) -> bool:
     """快照是否声明自己完整维护 ignored_subjects / purged_records。"""
     try:
@@ -813,6 +1040,84 @@ def _apply_sidecar_doulist_items(db, snapshot_path: Path) -> int:
                     f'UPDATE doulist_items SET {", ".join(assignments)}'
                     ' WHERE doulist_id=? AND media_type=? AND subject_id=?',
                     (*values, doulist_id, media_type, subject_id),
+                )
+                updated += int(cursor.rowcount or 0)
+            conn.commit()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return 0
+    return updated
+
+
+PLAN_SIDECAR_FIELDS = (
+    ('releaseDate', 'release_date'),
+    ('note', 'note'),
+    ('source', 'source'),
+    ('sourceID', 'source_id'),
+)
+
+
+def _apply_sidecar_plan_items(db, snapshot_path: Path) -> int:
+    """把 iOS 侧车里的计划条目字段补回本机（仅填空，不覆盖已有值）。
+
+    `statsText` 是 iOS 的展示文本，不写进 `plan_items.note`（note 只存用户备注）。
+    """
+    sidecar = snapshot_path.with_name(snapshot_path.name + '.ios.json')
+    if not sidecar.is_file():
+        return 0
+    try:
+        data = json.loads(sidecar.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return 0
+    items = data.get('planItems')
+    if not isinstance(items, list) or not items:
+        return 0
+
+    def norm(title: str) -> str:
+        return ' '.join(str(title or '').split()).strip()
+
+    updated = 0
+    try:
+        conn = sqlite3.connect(str(db.path))
+        try:
+            folders = {}
+            for row in conn.execute('SELECT id, media_type, title FROM plan_folders'):
+                folders[(str(row[1]), norm(row[2]))] = int(row[0])
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get('folderKey') or '')
+                parts = key.split(':', 2)
+                if len(parts) == 3 and parts[0] == 'local':
+                    media_type, title = parts[1], norm(parts[2])
+                else:
+                    media_type, title = str(item.get('mediaType') or ''), ''
+                folder_id = folders.get((media_type, title))
+                subject_id = str(item.get('subjectID') or '')
+                if folder_id is None or not subject_id:
+                    continue
+                row = conn.execute(
+                    'SELECT id, status, ' + ', '.join(col for _, col in PLAN_SIDECAR_FIELDS)
+                    + ' FROM plan_items WHERE folder_id=? AND media_type=? AND subject_id=?',
+                    (folder_id, media_type, subject_id),
+                ).fetchone()
+                if row is None:
+                    continue
+                assignments, values = [], []
+                for index, (source, column) in enumerate(PLAN_SIDECAR_FIELDS, start=2):
+                    value = item.get(source)
+                    if value is None or str(row[index] or '').strip():
+                        continue
+                    assignments.append(f'{column}=?')
+                    values.append(str(value))
+                if item.get('isRead') is False and str(row[1] or '') == 'done':
+                    assignments.append("status='wish'")
+                if not assignments:
+                    continue
+                cursor = conn.execute(
+                    f'UPDATE plan_items SET {", ".join(assignments)} WHERE id=?',
+                    (*values, int(row[0])),
                 )
                 updated += int(cursor.rowcount or 0)
             conn.commit()
@@ -907,6 +1212,7 @@ def create_snapshot(db, force: bool = False, kind: str = KIND_MANUAL) -> dict:
         )
         _embed_ios_explore_sites(target)
         _mark_marks_authoritative(target)
+        _write_movie_meta(target)
         target.commit()
         counts = _counts(target)
         media = _media_counts(target)
@@ -1063,9 +1369,16 @@ def restore_snapshot(db, manifest: Optional[dict] = None) -> dict:
         if value:
             db.set_setting(key, value)
     sync_book_pages(db)
+    sync_movie_durations(db)
     _restore_ios_compatibility(db, path)
+    persist_movie_durations(db)
     _apply_sidecar_covers(db, path)
     _apply_sidecar_doulist_items(db, path)
+    _apply_sidecar_plan_items(db, path)
+    # 侧车里的豆列条目可能自带时长/页数，先补进本机元数据，减少后续联网补全。
+    seed_from_doulist_items(db)
+    _merge_local_covers(db, local_backup)
+    db.fill_item_covers_from_records()
     _preserve_ios_markers(db, path, local_backup)
     _strip_snapshot_meta(db)
     state = state_id(db.path)

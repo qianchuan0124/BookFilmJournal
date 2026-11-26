@@ -437,7 +437,7 @@ class EditRecordDialog(MessageBoxBase):
         if pages:
             set_book_pages(self.record['subject_id'], pages, db=self.db)
         if minutes:
-            set_movie_duration(self.record['subject_id'], minutes)
+            set_movie_duration(self.record['subject_id'], minutes, db=self.db)
         return True
 
 
@@ -561,7 +561,8 @@ class MediaMetaDialog(MessageBoxBase):
                 self.subject_id, self._to_int(self.word_edit.text()))
         else:
             set_movie_duration(
-                self.subject_id, self._to_int(self.duration_edit.text()) or None)
+                self.subject_id, self._to_int(self.duration_edit.text()) or None,
+                db=self.db)
         return True
 
 
@@ -1762,7 +1763,7 @@ class AddRecordDialog(MessageBoxBase):
         if pages:
             set_book_pages(subject_id, pages, db=self.db)
         if minutes:
-            set_movie_duration(subject_id, minutes)
+            set_movie_duration(subject_id, minutes, db=self.db)
         return True
 
     def reject(self) -> None:

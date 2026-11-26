@@ -199,12 +199,71 @@ def manual_movie_duration(subject_id) -> Optional[int]:
     return value if value > 0 else None
 
 
-def set_movie_duration(subject_id, minutes: Optional[int]) -> None:
+def set_movie_duration(subject_id, minutes: Optional[int], db=None) -> None:
     cache = _read_json(MOVIE_META_CACHE)
     entry = cache.setdefault(str(subject_id), {})
-    entry['duration_manual'] = int(minutes or 0)
+    value = int(minutes or 0)
+    entry['duration_manual'] = value
+    if value:
+        # 同时记一份 durations，让「是否已补全」判定为完整，避免再向豆瓣请求。
+        entry['durations'] = [f'{value}分钟']
     _write_json(MOVIE_META_CACHE, cache)
     load_movie_meta.cache_clear()
+    if db is not None:
+        db.set_movie_duration(str(subject_id), int(minutes or 0), manual=True)
+
+
+def sync_movie_durations(db) -> None:
+    """数据库是时长的持久来源，恢复快照后用它补齐本机缓存。"""
+    cache = _read_json(MOVIE_META_CACHE)
+    changed = False
+    for entry in db.movie_duration_entries():
+        subject_id = str(entry['subject_id'])
+        minutes = int(entry['duration_minutes'] or 0)
+        if not minutes:
+            continue
+        item = cache.setdefault(subject_id, {})
+        if entry['duration_manual']:
+            if item.get('duration_manual') != minutes:
+                item['duration_manual'] = minutes
+                changed = True
+            values = [f'{minutes}分钟']
+            if item.get('durations') != values:
+                item['durations'] = values
+                changed = True
+        elif not item.get('duration_manual'):
+            values = [f'{minutes}分钟']
+            if item.get('durations') != values:
+                item['durations'] = values
+                changed = True
+    if changed:
+        _write_json(MOVIE_META_CACHE, cache)
+        load_movie_meta.cache_clear()
+
+
+def cached_movie_duration_entries() -> list[dict]:
+    """本机缓存里已有的影片时长，用于写入快照的 movie_meta 表。"""
+    cache = _read_json(MOVIE_META_CACHE)
+    entries = []
+    for subject_id, entry in cache.items():
+        manual = int(entry.get('duration_manual') or 0)
+        minutes = manual or parse_duration(' '.join(entry.get('durations') or [])) or 0
+        if not minutes:
+            continue
+        entries.append({'subject_id': str(subject_id),
+                        'duration_minutes': int(minutes),
+                        'duration_manual': bool(manual)})
+    return entries
+
+
+def persist_movie_durations(db) -> int:
+    """把本机缓存里已有的时长写进数据库（快照恢复后把侧车导入的时长固化）。"""
+    saved = 0
+    for entry in cached_movie_duration_entries():
+        db.set_movie_duration(entry['subject_id'], entry['duration_minutes'],
+                              manual=entry['duration_manual'])
+        saved += 1
+    return saved
 
 
 def movie_duration(subject_id) -> Optional[int]:
@@ -291,10 +350,27 @@ def ensure_subject_meta(media_type: str, subjects,
         subject_id = str(subject.get('subject_id') or '')
         if subject_id and subject_id not in unique:
             unique[subject_id] = subject
-    missing = [(subject_id, subject) for subject_id, subject in unique.items()
-               if not _meta_is_complete(media_type, cache.get(subject_id))]
+    # 影视时长常常能从简介里直接解析出来（如「片长: 122分钟」）。这种条目不值得
+    # 再请求一次豆瓣：先补进本机缓存，判定为完整后跳过。否则本机缓存丢失后，
+    # 每次同步都会把整库影片重拉一遍，耗时几分钟。
+    seeded = 0
+    missing = []
+    for subject_id, subject in unique.items():
+        if _meta_is_complete(media_type, cache.get(subject_id)):
+            continue
+        if media_type == 'movie':
+            minutes = parse_duration(subject.get('intro') or '')
+            if minutes:
+                entry = cache.setdefault(subject_id, {})
+                entry['durations'] = [f'{minutes}分钟']
+                seeded += 1
+                continue
+        missing.append((subject_id, subject))
+    if seeded:
+        _write_json(cache_path, cache)
+        load_movie_meta.cache_clear()
     if not missing:
-        return {'fetched': 0, 'failed': 0, 'skipped': len(unique)}
+        return {'fetched': 0, 'failed': 0, 'skipped': len(unique), 'seeded': seeded}
     if progress:
         label = '书籍' if media_type == 'book' else '影视'
         progress(f'补全{label}信息：剩余 {len(missing)} 条', 0, len(missing))
@@ -377,6 +453,10 @@ def ensure_subject_meta(media_type: str, subjects,
             if previous.get('duration_manual'):
                 entry['duration_manual'] = previous['duration_manual']
             cache[subject_id] = entry
+            if db is not None:
+                minutes = parse_duration(' '.join(entry.get('durations') or []))
+                if minutes:
+                    db.set_movie_duration(subject_id, minutes, manual=False)
         if fetched % 10 == 0:
             _write_json(cache_path, cache)
         if fetched % batch_size == 0:
@@ -410,6 +490,32 @@ def import_movie_durations(items) -> int:
         _write_json(MOVIE_META_CACHE, cache)
         load_movie_meta.cache_clear()
     return imported
+
+
+def seed_from_doulist_items(db) -> tuple[int, int]:
+    """豆列条目自带页数/时长时补进 book_meta / movie_meta。
+
+    iOS 侧车的 `doulistItems` 会写时长与页数，桌面端只更新了豆列条目本身；
+    同步后补全统计仍把这些条目当缺失，于是重复联网抓详情。这里先补种，
+    再统计缺失数量。
+    """
+    try:
+        entries = db.doulist_item_meta_entries()
+    except Exception:
+        return 0, 0
+    pages = [{'subject_id': entry['subject_id'], 'pages': entry['pages']}
+             for entry in entries
+             if entry['media_type'] == 'book' and entry['pages'] > 0]
+    added_pages = db.import_book_pages(pages) if pages else 0
+    if added_pages:
+        sync_book_pages(db)
+    durations = [(entry['subject_id'], entry['duration_minutes'])
+                 for entry in entries
+                 if entry['media_type'] == 'movie' and entry['duration_minutes'] > 0]
+    added_durations = import_movie_durations(durations) if durations else 0
+    if added_durations:
+        persist_movie_durations(db)
+    return added_pages, added_durations
 
 
 def format_book_stats(pages: Optional[int], word_count: int = 0) -> str:

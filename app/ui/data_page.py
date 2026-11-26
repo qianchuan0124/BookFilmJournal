@@ -26,7 +26,9 @@ from qfluentwidgets import (
     InfoBarPosition,
     LineEdit,
     MessageBox,
+    ProgressBar,
     PushButton,
+    StateToolTip,
     SwitchButton,
     Theme,
     TitleLabel,
@@ -49,9 +51,12 @@ from app.cloud_sync import (
 )
 from app.config import APP_VERSION_TEXT, OUTPUT_DIR, ROOT
 from app.db import Database
-from app.douban import cover_file_ok, fetch_cover
+from app.douban import cover_file_ok, fetch_cover, fetch_subject_detail
 from app.excel import ExcelError, default_export_name, export_excel, import_excel
-from app.media_meta import book_pages, ensure_subject_meta, sync_book_pages
+from app.media_meta import (
+    book_pages, ensure_subject_meta, movie_duration, seed_from_doulist_items,
+    sync_book_pages,
+)
 from app.profile import (
     DEFAULT_NAME,
     avatar_source,
@@ -128,17 +133,19 @@ def _missing_cover_rows(db: Database) -> list[tuple[str, object]]:
     return todo
 
 
-def missing_metadata_counts(db: Database) -> tuple[int, int]:
-    """统计缺失的封面张数与书籍页数，用于恢复后提示是否补全。"""
+def missing_metadata_counts(db: Database) -> tuple[int, int, int]:
+    """统计缺失的封面张数、书籍页数与影片时长，用于同步后自动补全。"""
     covers = len(_missing_cover_rows(db))
     pages = sum(1 for subject in db.book_subjects_for_meta()
                 if book_pages(subject['subject_id']) is None)
-    return covers, pages
+    durations = sum(1 for subject in db.movie_subjects_for_meta()
+                    if movie_duration(subject['subject_id']) is None)
+    return covers, pages, durations
 
 
 class BackfillWorker(QThread):
     progress = Signal(str, int, int)
-    done = Signal(int, int, int)
+    done = Signal(int, int, int, int)
 
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
@@ -147,25 +154,41 @@ class BackfillWorker(QThread):
     def _cover_rows(self) -> list[tuple[str, object]]:
         return _missing_cover_rows(self.db)
 
-    def _backfill_covers(self) -> int:
+    def _backfill_covers(self) -> tuple[int, int]:
         todo = self._cover_rows()
         downloaded = 0
+        failed = 0
         for index, (kind, row) in enumerate(todo, 1):
             self.progress.emit(f'正在补全封面 {index}/{len(todo)}…', index, len(todo))
+            cover_url = (row['cover_url'] or '').strip()
+            if not cover_url:
+                # 快照里没带封面地址（iOS 备份的计划条目常见），先解析条目详情拿封面地址。
+                try:
+                    detail = fetch_subject_detail(
+                        str(row['subject_id']), row['media_type'],
+                        self.db.get_setting('douban_cookie') or '',
+                    )
+                    cover_url = (detail.get('cover_url') or '').strip()
+                except Exception:  # noqa: BLE001 - 单条失败不影响整体
+                    cover_url = ''
+                if not cover_url:
+                    failed += 1
+                    continue
             path = fetch_cover(
-                row['cover_url'], row['media_type'], row['subject_id'],
+                cover_url, row['media_type'], row['subject_id'],
                 row['url'] or '',
             )
             if not path:
+                failed += 1
                 continue
             if kind == 'record':
-                self.db.set_record_cover(int(row['id']), path)
+                self.db.set_record_cover(int(row['id']), path, cover_url)
             elif kind == 'doulist':
-                self.db.set_doulist_item_cover(int(row['id']), path)
+                self.db.set_doulist_item_cover(int(row['id']), path, cover_url)
             else:
-                self.db.set_plan_item_cover(int(row['id']), path)
+                self.db.set_plan_item_cover(int(row['id']), path, cover_url)
             downloaded += 1
-        return downloaded
+        return downloaded, failed
 
     def _backfill_pages(self) -> tuple[int, int]:
         missing = [subject for subject in self.db.book_subjects_for_meta()
@@ -179,10 +202,25 @@ class BackfillWorker(QThread):
         )
         return int(result.get('fetched', 0)), int(result.get('failed', 0))
 
+    def _backfill_durations(self) -> tuple[int, int]:
+        missing = [subject for subject in self.db.movie_subjects_for_meta()
+                   if movie_duration(subject['subject_id']) is None]
+        if not missing:
+            return 0, 0
+        result = ensure_subject_meta(
+            'movie', missing,
+            progress=lambda message, index, total: self.progress.emit(message, index, total),
+            db=self.db,
+        )
+        return int(result.get('fetched', 0)), int(result.get('failed', 0))
+
     def run(self) -> None:
-        covers = self._backfill_covers()
-        pages, failed = self._backfill_pages()
-        self.done.emit(covers, pages, failed)
+        # 豆列条目已带页数/时长时直接补种，避免重复联网抓详情。
+        seed_from_doulist_items(self.db)
+        covers, cover_failed = self._backfill_covers()
+        pages, page_failed = self._backfill_pages()
+        durations, duration_failed = self._backfill_durations()
+        self.done.emit(covers, pages, durations, cover_failed + page_failed + duration_failed)
 
 
 class DataPage(QWidget):
@@ -193,6 +231,8 @@ class DataPage(QWidget):
         self.db = db
         self.setObjectName('dataPage')
         self._dirty = False
+        self._backfill_worker = None
+        self._backfill_tip = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(32, 26, 32, 0)
@@ -272,8 +312,7 @@ class DataPage(QWidget):
         sync_layout.setSpacing(10)
         sync_layout.addWidget(BodyLabel('云同步（iCloud / OneDrive）', sync_card))
         sync_hint = CaptionLabel(
-            '需先在系统设置开启 iCloud 云盘（Windows 装 iCloud for Windows）。'
-            '快照不含登录 Cookie 和封面图片，封面可在新设备上补全。',
+            '快照经 iCloud 云盘或 OneDrive 同步，不含登录状态与封面图片。',
             sync_card,)
         sync_hint.setWordWrap(True)
         sync_hint.setTextColor('#5f6b7a', '#8d95a5')
@@ -282,6 +321,12 @@ class DataPage(QWidget):
         self.sync_status.setWordWrap(True)
         self.sync_status.setTextColor('#5f6b7a', '#8d95a5')
         sync_layout.addWidget(self.sync_status)
+        # 补全封面/页数时的进度条：放在同步卡片里，避免用户只看到一行容易被刷掉的小字。
+        self.backfill_progress = ProgressBar(sync_card)
+        self.backfill_progress.setRange(0, 1)
+        self.backfill_progress.setValue(0)
+        self.backfill_progress.setVisible(False)
+        sync_layout.addWidget(self.backfill_progress)
 
         auto_row = QHBoxLayout()
         auto_row.setSpacing(10)
@@ -291,7 +336,7 @@ class DataPage(QWidget):
         self.auto_backup_switch.checkedChanged.connect(self._on_auto_backup_changed)
         auto_row.addWidget(self.auto_backup_switch)
         auto_label = CaptionLabel(
-            '自动备份：数据变动后自动生成快照，每台设备保留最近 3 份自动 + 2 份手动备份',
+            '自动备份：数据改动后自动生成快照，每设备保留 3 份自动 + 2 份手动',
             sync_card)
         auto_label.setWordWrap(True)
         auto_label.setTextColor('#5f6b7a', '#8d95a5')
@@ -306,8 +351,7 @@ class DataPage(QWidget):
         self.auto_sync_switch.checkedChanged.connect(self._on_auto_sync_changed)
         sync_auto_row.addWidget(self.auto_sync_switch)
         auto_sync_label = CaptionLabel(
-            '自动同步：启动时如果云端有更新的快照、且本机没有未备份的改动，'
-            '自动恢复最新的数据',
+            '自动同步：启动时若云端更新、且本机无未备份改动，自动恢复',
             sync_card)
         auto_sync_label.setWordWrap(True)
         auto_sync_label.setTextColor('#5f6b7a', '#8d95a5')
@@ -701,22 +745,75 @@ class DataPage(QWidget):
         self.excel_status.setText('导入完成：' + message)
         InfoBar.success('导入完成', message, parent=self, position=InfoBarPosition.TOP, duration=8000)
 
+    def auto_backfill(self, restored: bool = False) -> None:
+        """同步/恢复后自动检查并补全封面、页数、时长（无需用户确认）。"""
+        if self._backfill_worker is not None and self._backfill_worker.isRunning():
+            return
+        seed_from_doulist_items(self.db)
+        covers, pages, durations = missing_metadata_counts(self.db)
+        if not (covers or pages or durations):
+            return
+        missing = []
+        if covers:
+            missing.append(f'{covers} 张封面')
+        if pages:
+            missing.append(f'{pages} 本书的页数')
+        if durations:
+            missing.append(f'{durations} 部影片的时长')
+        prefix = '恢复完成，检测到缺少' if restored else '检测到缺少'
+        InfoBar.info(
+            '自动补全信息',
+            f'{prefix}' + '、'.join(missing) + '，正在后台从豆瓣补全。',
+            parent=self, position=InfoBarPosition.TOP, duration=5000,
+        )
+        self.backfill_metadata(reason='restore')
+
     def backfill_metadata(self, reason: str = 'import') -> None:
+        if self._backfill_worker is not None and self._backfill_worker.isRunning():
+            return
         self._backfill_reason = reason
+        self.backfill_progress.setRange(0, 0)  # 未知总数时先走不确定进度
+        self.backfill_progress.setVisible(True)
+        if reason == 'restore':
+            self.sync_status.setText('正在从豆瓣补全封面与页数…')
+        else:
+            self.excel_status.setText('正在从豆瓣补全封面与页数…')
+        self._backfill_tip = StateToolTip('正在补全', '正在从豆瓣补全封面与页数…', self.window())
+        self._backfill_tip.move(self._backfill_tip.getSuitablePos())
+        self._backfill_tip.show()
+        InfoBar.info('开始补全', '正在从豆瓣补全封面与页数，完成后会自动提示。',
+                     parent=self, position=InfoBarPosition.TOP, duration=4000)
         self._backfill_worker = BackfillWorker(self.db, self)
         self._backfill_worker.progress.connect(self._on_backfill_progress)
         self._backfill_worker.done.connect(self._on_backfill_done)
         self._backfill_worker.start()
 
     def _on_backfill_progress(self, message: str, index: int, total: int) -> None:
-        text = f'{message}（{index}/{total}）' if total else message
+        if total and f'{index}/{total}' not in message:
+            text = f'{message}（{index}/{total}）'
+        else:
+            text = message
+        if total > 0:
+            self.backfill_progress.setRange(0, total)
+            self.backfill_progress.setValue(min(index, total))
+        if self._backfill_tip is not None:
+            self._backfill_tip.setContent(text)
         if getattr(self, '_backfill_reason', 'import') == 'restore':
             self.sync_status.setText(text)
         else:
             self.excel_status.setText(text)
 
-    def _on_backfill_done(self, covers: int, pages: int, failed: int = 0) -> None:
+    def _on_backfill_done(self, covers: int, pages: int, durations: int = 0,
+                          failed: int = 0) -> None:
         restore = getattr(self, '_backfill_reason', 'import') == 'restore'
+        # done 是在线程 run() 末尾发出的，这里先清掉引用，避免 refresh_sync 误判“仍在补全”。
+        self._backfill_worker = None
+        if self._backfill_tip is not None:
+            self._backfill_tip.setContent('补全结束，详见提示信息')
+            self._backfill_tip.setState(True)
+            self._backfill_tip = None
+        self.backfill_progress.setVisible(False)
+        self.backfill_progress.setRange(0, 1)
         if not restore:
             self.excel_status.setText('导出文件默认保存在 output/exports。')
         self.refresh()
@@ -726,9 +823,15 @@ class DataPage(QWidget):
             parts.append(f'封面 {covers} 张')
         if pages:
             parts.append(f'页数 {pages} 条')
+        if durations:
+            parts.append(f'时长 {durations} 条')
         if parts:
             InfoBar.success('信息已补全', '已从豆瓣补全' + '、'.join(parts) + '。', parent=self,
                             position=InfoBarPosition.TOP, duration=5000)
+        elif not failed:
+            # 没有可补的内容时也要给反馈，避免看起来像卡住。
+            InfoBar.info('无需补全', '本机封面与页数都是完整的。', parent=self,
+                         position=InfoBarPosition.TOP, duration=4000)
         if failed:
             hint = '可稍后重试。'
             if not (self.db.get_setting('douban_cookie') or '').strip():
@@ -746,53 +849,42 @@ class DataPage(QWidget):
         lines = []
         root = base_dir(self.db)
         if root is None:
-            lines.append('未检测到 iCloud 云盘或 OneDrive，请选择同步目录。')
+            lines.append('未检测到云盘，请选择同步目录')
         elif not root.is_dir():
-            lines.append('同步目录不可用，请重新选择。')
+            lines.append('同步目录不可用，请重新选择')
         local = db_overview(self.db)
         local_counts = local.get('counts') or {}
         manifest = info.get('manifest')
         if manifest:
             if info.get('missing'):
-                lines.append(f'最新快照 {manifest.get("snapshot")} 尚未下载完成。')
+                lines.append('最新快照还在下载，稍后再试')
             else:
                 counts = manifest.get('counts') or {}
                 movie, book = counts.get('records_movie'), counts.get('records_book')
                 if movie is not None and book is not None:
-                    records_text = f'影视 {movie} · 读书 {book}'
-                    local_movie = local_counts.get('records_movie', 0)
-                    local_book = local_counts.get('records_book', 0)
+                    records_text = f'影视 {movie} / 读书 {book}'
                     deltas = []
-                    if movie - local_movie:
-                        deltas.append(f'影视 {"+" if movie > local_movie else ""}{movie - local_movie}')
-                    if book - local_book:
-                        deltas.append(f'读书 {"+" if book > local_book else ""}{book - local_book}')
-                    compared = ('（' + '、'.join(deltas) + '）') if deltas else '（与本机相同）'
+                    for label, value, mine in (('影视', movie, local_counts.get('records_movie', 0)),
+                                               ('读书', book, local_counts.get('records_book', 0))):
+                        if value != mine:
+                            deltas.append(f'{label} {value - mine:+d}')
+                    compared = f'（{"、".join(deltas)}）' if deltas else '（与本机一致）'
                 else:
                     diff = int(counts.get('records', 0)) - int(local_counts.get('records', 0))
-                    if diff > 0:
-                        compared = f'（较本机多 {diff} 条记录）'
-                    elif diff < 0:
-                        compared = f'（较本机少 {-diff} 条记录）'
-                    else:
-                        compared = '（记录数与本机相同）'
-                    records_text = f'记录 {counts.get("records", 0)} 条'
-                device_text = manifest.get('device', '未知设备')
+                    compared = f'（{diff:+d} 条）' if diff else '（与本机一致）'
+                    records_text = f'记录 {counts.get("records", 0)}'
+                created = str(manifest.get('created_at', ''))[:16]
+                device_text = str(manifest.get('device', '未知设备')).removesuffix('.local')
                 if manifest.get('platform'):
-                    device_text += f' · {manifest.get("platform")}'
-                lines.append(
-                    f'最近备份：{manifest.get("created_at", "未知时间")}'
-                    f' · {device_text}'
-                    f' · {records_text}{compared}'
-                )
+                    device_text += f' · {manifest["platform"]}'
+                lines.append(f'{created} · {device_text} · {records_text}{compared}')
         elif info['folder'] and Path(info['folder']).is_dir():
-            lines.append('同步目录里还没有备份，点击「立即备份」创建第一份。')
+            lines.append('还没有备份，点「立即备份」创建第一份')
         if manifest and info.get('dirty'):
-            lines.append('本地有尚未备份的改动。')
-        auto_backup = self.db.get_setting(SETTING_AUTO_BACKUP) == '1'
-        auto_sync = self.db.get_setting(SETTING_AUTO_SYNC) == '1'
-        lines.append('自动备份：%s · 自动同步：%s' % ('开' if auto_backup else '关',
-                                             '开' if auto_sync else '关'))
+            lines.append('本机有未备份的改动')
+        if self._backfill_worker is not None and self._backfill_worker.isRunning():
+            # 补全进行中，别把进度文字刷新掉
+            return
         self.sync_status.setText('\n'.join(lines))
 
     def choose_sync_dir(self) -> None:
@@ -923,25 +1015,7 @@ class DataPage(QWidget):
             f"已恢复 {restored.get('records', 0)} 条记录；旧数据库备份在 {result['local_backup']}",
             parent=self, position=InfoBarPosition.TOP, duration=8000,
         )
-        covers, pages = missing_metadata_counts(self.db)
-        if not covers and not pages:
-            return
-        missing = []
-        if covers:
-            missing.append(f'{covers} 张封面')
-        if pages:
-            missing.append(f'{pages} 本书的页数')
-        box = MessageBox(
-            '补全封面与页数',
-            '快照包含书籍页数，但封面图片仍保存在本机，检测到缺少' + '、'.join(missing) + '。\n\n'
-            '现在从豆瓣公开页面补全吗？补全无需登录；'
-            '如果条目无法访问或触发风控，可登录豆瓣后重试。',
-            self.window(),
-        )
-        box.yesButton.setText('开始补全')
-        box.cancelButton.setText('稍后')
-        if box.exec():
-            self.backfill_metadata(reason='restore')
+        self.auto_backfill(restored=True)
 
     def open_data_dir(self) -> None:
         ROOT.mkdir(parents=True, exist_ok=True)

@@ -1,9 +1,10 @@
 """Generate the onboarding guide images used by README.md.
 
 Usage:
-    GUIDE_PREVIEW_DIR=~/Desktop/preview .venv/bin/python tools/make_guide_images.py
+    .venv/bin/python tools/make_guide_images.py
+    GUIDE_PREVIEW_DIR=/path/to/preview .venv/bin/python tools/make_guide_images.py
 
-Input screenshots come from GUIDE_PREVIEW_DIR (default ~/Desktop/preview).
+Input screenshots come from GUIDE_PREVIEW_DIR (default docs/images in this repo).
 Each output is one original app screenshot with a dark mask, cut-out highlights,
 small speech bubbles, and the flow title drawn on top of the image itself.
 Steps that happen on the same screen are all placed on that single image.
@@ -14,7 +15,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 PREVIEW = Path(os.environ.get(
-    'GUIDE_PREVIEW_DIR', str(Path.home() / 'Desktop' / 'preview'))).expanduser()
+    'GUIDE_PREVIEW_DIR', str(REPO / 'docs' / 'images'))).expanduser()
 OUTPUT = REPO / 'docs' / 'images'
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -71,6 +72,8 @@ def overlaps(a: Rect, b: Rect, margin: int = 0) -> bool:
 
 def draw_tail(draw, side: str, bx: int, by: int, bw: int, bh: int,
               cx: int, cy: int) -> None:
+    # side 是气泡相对高亮框的位置：below/above 尾巴朝上/朝下，
+    # right 尾巴在左边缘朝左，left 尾巴在右边缘朝右。
     size = 11
     if side == 'below':
         tx = min(max(cx, bx + 18), bx + bw - 18)
@@ -182,11 +185,15 @@ def annotate(img: Image.Image, callouts: list[Callout], total: int,
     for raw, boxes, callout in groups:
         step, step_title, body = callout[1:4]
         prefer = callout[4] if len(callout) > 4 else ''
+        explicit = callout[5] if len(callout) > 5 else None
         lines = wrap(body, body_ft, text_width)
         bh = 14 + 24 + 6 + len(lines) * 23 + 13
         anchor = boxes[0]
-        side, bx, by = place_bubble(width, height, bw, bh, raw[0], obstacles, placed,
-                                    prefer=prefer)
+        if explicit:
+            side, bx, by = prefer or 'below', explicit[0], explicit[1]
+        else:
+            side, bx, by = place_bubble(width, height, bw, bh, raw[0], obstacles, placed,
+                                        prefer=prefer)
         placed.append((bx, by, bx + bw, by + bh))
 
         cx = (anchor[0] + anchor[2]) // 2
@@ -219,19 +226,25 @@ def annotate(img: Image.Image, callouts: list[Callout], total: int,
 
 
 def main() -> None:
-    p1 = load_preview('preview_1.png', ((352, 227, 500, 253),))
-    ImageDraw.Draw(p1).text((360, 231), '12345678', font=font(15), fill=(210, 210, 210))
-    p2 = load_preview('preview_2.png')
-    p3 = load_preview('preview_3.png')
-    p8 = load_preview('preview_8.png')
-    p9 = load_preview('preview_9.png')
-    p10 = load_preview('preview_10.png')
-    p11 = load_preview('preview_11.png')
-    p6 = load_preview('preview_6.png', (
+    def optional(name: str, redactions: tuple[Rect, ...] = ()):
+        return load_preview(name, redactions) if (PREVIEW / name).is_file() else None
+
+    p1 = optional('preview_1.png', ((352, 227, 500, 253),))
+    if p1 is not None:
+        ImageDraw.Draw(p1).text((360, 231), '12345678', font=font(15), fill=(210, 210, 210))
+    p2 = optional('preview_2.png')
+    p3 = optional('preview_3.png')
+    p6 = optional('preview_6.png', (
         (250, 549, 762, 569),
         (284, 698, 508, 719),
         (330, 844, 762, 864),
     ))
+    p8 = optional('preview_8.png')
+    p9 = optional('preview_9.png')
+    p10 = optional('preview_10.png')
+    p11 = optional('preview_11.png')
+    p12 = optional('preview_12.png')
+    p13 = optional('preview_13.png')
 
     jobs = [
         ('guide-sync.png', p1, 3, '同步豆瓣收藏',
@@ -291,6 +304,22 @@ def main() -> None:
              ((234, 475, 1246, 529), 2, '查看生成结果',
               '生成的 HTML / PNG 会列在下方，可直接打开或删除。', 'below'),
          ]),
+        ('guide-explore.png', p12, 3, '探索空间',
+         '站点清单从云端下发，也可以添加自己的本地站点', [
+             ((232, 157, 594, 194), 1, '拉取配置或新增站点',
+              '站点清单从 GitHub 拉取，失败自动回退 Gitee；也可以添加自己的本地站点。',
+              'right', (640, 46)),
+             ((236, 218, 1238, 284), 2, '配置来源与版本',
+              '显示当前站点来自哪里（GitHub / Gitee / iOS 快照）和站点数量。', 'below'),
+             ((1056, 342, 1236, 393), 3, '排序、打开与复制',
+              '上下箭头调整顺序，点整行复制链接；左侧圆点表示连通性。', 'left'),
+         ]),
+        ('guide-explore-2.png', p13, 1, '记录详情 · 站点跳转',
+         '在探索空间配好站点后，详情页可以直接按标题搜索', [
+             ((445, 566, 1056, 680), 1, '资源站点直达',
+              '点站点按钮就用当前标题在该站搜索；按钮前的符号表示上次连通性检测：'
+              '对勾可访问、叉号不可访问、圆点未检测。', 'above', (720, 396)),
+         ]),
         ('guide-settings.png', p6, 3, '应用设置',
          '外观、Excel 备份与本地字数统计都在这里', [
              ((254, 242, 338, 266), 1, '切换暗色 / 亮色',
@@ -303,10 +332,16 @@ def main() -> None:
     ]
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
+    # 只清理已经没有对应任务的旧图；预览图缺失被跳过的任务保留原图，避免误删。
+    job_names = {name for name, *_ in jobs}
     for stale in OUTPUT.glob('guide-*.png'):
-        stale.unlink()
+        if stale.name not in job_names:
+            stale.unlink()
 
     for name, img, total, title, subtitle, callouts in jobs:
+        if img is None:
+            print('skip (missing preview):', name)
+            continue
         result = annotate(img, callouts, total, title, subtitle)
         result.save(OUTPUT / name, optimize=True)
 

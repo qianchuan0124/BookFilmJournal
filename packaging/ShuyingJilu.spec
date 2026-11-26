@@ -30,7 +30,7 @@ a = Analysis(
     [str(PROJECT_ROOT / 'main.py')],
     pathex=[str(PROJECT_ROOT)],
     binaries=qf_binaries,
-    datas=qf_datas,
+    datas=qf_datas + [(str(PROJECT_ROOT / 'config'), 'config')],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

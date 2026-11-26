@@ -26,6 +26,17 @@ def resolve_cover_path(cover_path: str) -> Optional[Path]:
     return path if path.is_file() else None
 
 
+def cover_is_valid(cover_path: str) -> bool:
+    """本地封面文件是否可用于展示（存在且不是反爬挑战页那种小文件）。"""
+    path = resolve_cover_path(cover_path)
+    if path is None:
+        return False
+    try:
+        return path.stat().st_size > 500
+    except OSError:
+        return False
+
+
 def is_custom_cover(media_type: str, subject_id, cover_path: str) -> bool:
     """文件名不是豆瓣封面命名规则时，视为需要随云同步的自定义封面。"""
     path = resolve_cover_path(cover_path)

@@ -1,0 +1,62 @@
+{
+  "version": 3,
+  "movie": [
+    {
+      "name": "豆瓣电影",
+      "url": "https://movie.douban.com",
+      "searchUrl": "https://movie.douban.com/subject_search?search_text={title}"
+    },
+    {
+      "name": "TMDB",
+      "url": "https://www.themoviedb.org",
+      "searchUrl": "https://www.themoviedb.org/search?query={title}"
+    },
+    {
+      "name": "爱奇艺",
+      "url": "https://www.iqiyi.com",
+      "searchUrl": "https://so.iqiyi.com/so/q_{title}"
+    },
+    {
+      "name": "腾讯视频",
+      "url": "https://v.qq.com",
+      "searchUrl": "https://v.qq.com/x/search/?q={title}"
+    },
+    {
+      "name": "Letterboxd",
+      "url": "https://letterboxd.com",
+      "searchUrl": "https://letterboxd.com/search/{title}/"
+    },
+    {
+      "name": "Seedhub",
+      "url": "https://www.seedhub.cc",
+      "searchUrl": "https://www.seedhub.cc/s/{title}"
+    }
+  ],
+  "book": [
+    {
+      "name": "豆瓣读书",
+      "url": "https://book.douban.com",
+      "searchUrl": "https://book.douban.com/subject_search?search_text={title}"
+    },
+    {
+      "name": "Goodreads",
+      "url": "https://www.goodreads.com",
+      "searchUrl": "https://www.goodreads.com/search?q={title}"
+    },
+    {
+      "name": "微信读书",
+      "url": "https://weread.qq.com",
+      "searchUrl": "https://weread.qq.com/web/search/books?keyword={title}"
+    },
+    {
+      "name": "Open Library",
+      "url": "https://openlibrary.org",
+      "searchUrl": "https://openlibrary.org/search?q={title}"
+    },
+    {
+      "name": "Zlibrary",
+      "url": "https://lib.sk",
+      "searchUrl": "https://lib.sk/s/{title}"
+    }
+  ]
+}

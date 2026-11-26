@@ -935,7 +935,10 @@ def sync_to_db(media_types: list[str], user_id: str, cookie: str, db: Database,
                             meta_subjects[item['media_type']].setdefault(
                                 str(item['subject_id']),
                                 {'subject_id': item['subject_id'], 'title': item['title'],
-                                 'url': item.get('url', '')},
+                                 'url': item.get('url', ''),
+                                 # 带上简介：影视时长可直接从「122分钟」解析出来，
+                                 # 补全时就不必再逐条请求豆瓣。
+                                 'intro': item.get('intro') or ''},
                             )
                     media_type = doulist.get('media_type') or 'mixed'
                     types = {item['media_type'] for item in items}
@@ -967,4 +970,5 @@ def sync_to_db(media_types: list[str], user_id: str, cookie: str, db: Database,
             ensure_subject_meta(media_type, subjects.values(), progress, db=db)
         except Exception as exc:
             summary['meta_error'] = str(exc)
+    db.fill_item_covers_from_records()
     return summary

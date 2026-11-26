@@ -6,17 +6,25 @@
 from __future__ import annotations
 
 import json
+import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Callable, Optional
 
 import requests
+
+from app.config import ROOT
 
 SETTING_KEY = 'explore_sites'
 MOVIE = 'movie'
 BOOK = 'book'
 
-REMOTE_SOURCES = (
+# 配置源写在外置文件里，方便部署时替换或指向自己的仓库。
+# 查找顺序：用户数据目录（可覆盖）→ 打包内置 → 代码内置默认值。
+CONFIG_RELATIVE = Path('config') / 'explore_sources.json'
+
+DEFAULT_SOURCES = (
     {
         'id': 'github',
         'name': 'GitHub',
@@ -28,6 +36,42 @@ REMOTE_SOURCES = (
         'url': 'https://gitee.com/catnine/bookfilm-sites/raw/main/sites.json',
     },
 )
+
+
+def _source_files() -> list[Path]:
+    paths = [ROOT / CONFIG_RELATIVE]
+    bundle = getattr(sys, '_MEIPASS', '')
+    if bundle:
+        paths.append(Path(bundle) / CONFIG_RELATIVE)
+    return paths
+
+
+def load_remote_sources() -> tuple[dict, ...]:
+    """读取配置源清单；文件缺失或格式不对时退回内置默认值。"""
+    for path in _source_files():
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        items = data.get('sources') if isinstance(data, dict) else data
+        if not isinstance(items, list):
+            continue
+        sources = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            url = str(item.get('url') or '').strip()
+            if not url:
+                continue
+            name = str(item.get('name') or '').strip() or url
+            source_id = str(item.get('id') or '').strip() or name.lower()
+            sources.append({'id': source_id, 'name': name, 'url': url})
+        if sources:
+            return tuple(sources)
+    return DEFAULT_SOURCES
+
+
+REMOTE_SOURCES = load_remote_sources()
 
 USER_AGENT = (
     'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) '

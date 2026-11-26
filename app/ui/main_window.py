@@ -9,6 +9,7 @@ from qfluentwidgets import (
 from app.cloud_sync import auto_backup, auto_restore
 from app.config import APP_VERSION_TEXT
 from app.db import Database
+from app.media_meta import seed_from_doulist_items
 from app.ui.records_page import RecordsPage
 from app.ui.doulist_page import DoulistPage
 from app.ui.report_page import ReportPage
@@ -22,6 +23,10 @@ class MainWindow(FluentWindow):
     def __init__(self, db: Database = None):
         super().__init__()
         self.db = db or Database()
+        # 历史数据里计划/豆列条目可能缺封面（尤其从 iOS 快照恢复后），启动时顺手补一次。
+        self.db.fill_item_covers_from_records()
+        # 豆列条目自带的时长/页数先补进本机元数据，避免重复联网补全。
+        seed_from_doulist_items(self.db)
         self.setWindowTitle('书影记录')
         self.resize(1280, 860)
         # 关闭页面切换时的上滑动画，避免切换后页面先偏下再跳到顶部。
@@ -102,6 +107,8 @@ class MainWindow(FluentWindow):
         self.report_page.mark_dirty()
         self.data_page.mark_dirty()
         self.data_page.refresh_sync()
+        # 恢复后自动补全缺失的封面 / 页数 / 时长（后台线程 + 悬浮进度）。
+        self.data_page.auto_backfill(restored=True)
         InfoBar.success(
             '已自动同步云端数据',
             f"启动时检测到更新的快照，已恢复 {counts.get('records', 0)} 条记录。",

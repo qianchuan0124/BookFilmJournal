@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from app.config import DB_PATH, ensure_dirs
+from app.cover_sync import cover_is_valid, is_custom_cover
 
 
 def _now() -> str:
@@ -111,6 +112,12 @@ CREATE TABLE IF NOT EXISTS book_meta (
     subject_id TEXT PRIMARY KEY,
     pages INTEGER NOT NULL DEFAULT 0,
     pages_manual INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS movie_meta (
+    subject_id TEXT PRIMARY KEY,
+    duration_minutes INTEGER NOT NULL DEFAULT 0,
+    duration_manual INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS settings (
@@ -348,10 +355,13 @@ class Database:
                     continue
                 existing = conn.execute(
                     'SELECT id, date_overridden, rating_overridden, comment_overridden,'
-                    ' deleted_at, deleted_by, title FROM records'
+                    ' deleted_at, deleted_by, title, cover_url, cover_path FROM records'
                     ' WHERE media_type=? AND subject_id=? AND status=?',
                     (media_type, subject_id, status),
                 ).fetchone()
+                # 用户自选的封面（本地上传 / 其他条目链接）同步时不能被豆瓣封面顶掉。
+                keep_cover = bool(existing) and is_custom_cover(
+                    media_type, subject_id, existing['cover_path'] or '')
                 restored = False
                 if existing and existing['deleted_at']:
                     if existing['deleted_by'] != 'sync':
@@ -366,6 +376,21 @@ class Database:
                 if existing:
                     if mode != 'full' and not restored:
                         skipped += 1
+                        # 增量同步不更新已存在的记录，但本地缺封面时补上本次下载到的封面，
+                        # 否则封面文件下好了、库里路径还是空，界面永远显示不出来。
+                        incoming_cover = record.get('cover_path') or ''
+                        if (incoming_cover and not cover_is_valid(existing['cover_path'] or '')
+                                and not is_custom_cover(media_type, subject_id,
+                                                        existing['cover_path'] or '')):
+                            conn.execute(
+                                'UPDATE records SET cover_path=? WHERE id=?',
+                                (incoming_cover, existing['id']),
+                            )
+                            if not existing['cover_url'] and record.get('cover_url'):
+                                conn.execute(
+                                    'UPDATE records SET cover_url=? WHERE id=?',
+                                    (record.get('cover_url') or '', existing['id']),
+                                )
                         continue
                     new_title = record.get('title', '')
                     old_title = existing['title'] or ''
@@ -375,7 +400,8 @@ class Database:
                     conn.execute('''
                         UPDATE records SET
                             title=?, url=?, cover_url=?,
-                            cover_path=CASE WHEN ?<>'' THEN ? ELSE cover_path END,
+                            cover_path=CASE WHEN ?=1 THEN cover_path
+                                            WHEN ?<>'' THEN ? ELSE cover_path END,
                             rating=CASE WHEN rating_overridden=1 THEN rating ELSE ? END,
                             marked_date=?,
                             effective_date=CASE WHEN date_overridden=1 THEN effective_date ELSE ? END,
@@ -386,7 +412,7 @@ class Database:
                         WHERE id=?
                     ''', (
                         new_title, record.get('url', ''), record.get('cover_url', ''),
-                        record.get('cover_path', ''), record.get('cover_path', ''),
+                        int(keep_cover), record.get('cover_path', ''), record.get('cover_path', ''),
                         int(record.get('rating') or 0), record.get('marked_date', ''),
                         record.get('marked_date', ''),
                         record.get('comment', ''), record.get('intro', ''), now, now,
@@ -603,11 +629,19 @@ class Database:
             return conn.execute('''
                 SELECT id, media_type, subject_id, title, url, cover_url, cover_path
                 FROM records
-                WHERE deleted_at='' AND cover_url<>''
+                WHERE deleted_at='' AND (cover_url<>'' OR cover_path='')
             ''').fetchall()
 
-    def set_record_cover(self, record_id: int, cover_path: str) -> None:
+    def set_record_cover(self, record_id: int, cover_path: str,
+                         cover_url: Optional[str] = None) -> None:
         with self._connect() as conn:
+            if cover_url:
+                conn.execute(
+                    "UPDATE records SET cover_path=?, cover_url=CASE WHEN cover_url=''"
+                    ' THEN ? ELSE cover_url END, updated_at=? WHERE id=?',
+                    (cover_path, cover_url, _now(), record_id),
+                )
+                return
             conn.execute(
                 'UPDATE records SET cover_path=?, updated_at=? WHERE id=?',
                 (cover_path, _now(), record_id),
@@ -620,7 +654,7 @@ class Database:
                        i.cover_url, i.cover_path
                 FROM doulist_items i
                 JOIN doulists d ON d.id=i.doulist_id AND d.deleted_at=''
-                WHERE i.cover_url<>''
+                WHERE i.cover_url<>'' OR i.cover_path=''
             ''').fetchall()
 
     def plan_items_with_cover_url(self) -> list[sqlite3.Row]:
@@ -628,16 +662,68 @@ class Database:
             return conn.execute('''
                 SELECT id, media_type, subject_id, title, url, cover_url, cover_path
                 FROM plan_items
-                WHERE deleted_at='' AND cover_url<>''
+                WHERE deleted_at='' AND (cover_url<>'' OR cover_path='')
             ''').fetchall()
 
-    def set_doulist_item_cover(self, item_id: int, cover_path: str) -> None:
+    def fill_item_covers_from_records(self) -> int:
+        """豆列/计划条目缺封面时，从同豆瓣条目的记录里借一份（恢复 iOS 快照后常见）。
+
+        iOS 快照的计划条目不带封面地址；如果本机有对应记录且已有封面文件，直接复用，
+        不必再走一次豆瓣补全。
+        """
+        updated = 0
         with self._connect() as conn:
+            covers = {}
+            for row in conn.execute(
+                "SELECT media_type, subject_id, cover_url, cover_path FROM records"
+                " WHERE deleted_at='' AND (cover_url<>'' OR cover_path<>'')"
+            ):
+                covers.setdefault((row['media_type'], str(row['subject_id'])),
+                                  (row['cover_url'] or '', row['cover_path'] or ''))
+            if not covers:
+                return 0
+            for table in ('doulist_items', 'plan_items'):
+                rows = conn.execute(
+                    f'SELECT id, media_type, subject_id, cover_url, cover_path FROM {table}'
+                ).fetchall()
+                for row in rows:
+                    url, path = covers.get((row['media_type'], str(row['subject_id'])), ('', ''))
+                    if not url and not path:
+                        continue
+                    new_url = row['cover_url'] or url
+                    new_path = row['cover_path'] or path
+                    if new_url == (row['cover_url'] or '') and new_path == (row['cover_path'] or ''):
+                        continue
+                    conn.execute(
+                        f'UPDATE {table} SET cover_url=?, cover_path=? WHERE id=?',
+                        (new_url, new_path, row['id']),
+                    )
+                    updated += 1
+        return updated
+
+    def set_doulist_item_cover(self, item_id: int, cover_path: str,
+                               cover_url: Optional[str] = None) -> None:
+        with self._connect() as conn:
+            if cover_url:
+                conn.execute(
+                    "UPDATE doulist_items SET cover_path=?, cover_url=CASE WHEN cover_url=''"
+                    ' THEN ? ELSE cover_url END WHERE id=?',
+                    (cover_path, cover_url, int(item_id)),
+                )
+                return
             conn.execute('UPDATE doulist_items SET cover_path=? WHERE id=?',
                          (cover_path, int(item_id)))
 
-    def set_plan_item_cover(self, item_id: int, cover_path: str) -> None:
+    def set_plan_item_cover(self, item_id: int, cover_path: str,
+                            cover_url: Optional[str] = None) -> None:
         with self._connect() as conn:
+            if cover_url:
+                conn.execute(
+                    "UPDATE plan_items SET cover_path=?, cover_url=CASE WHEN cover_url=''"
+                    ' THEN ? ELSE cover_url END WHERE id=?',
+                    (cover_path, cover_url, int(item_id)),
+                )
+                return
             conn.execute('UPDATE plan_items SET cover_path=? WHERE id=?',
                          (cover_path, int(item_id)))
 
@@ -661,6 +747,27 @@ class Database:
             ''').fetchall()
         return [{'subject_id': str(row['subject_id']), 'title': row['title'] or ''}
                 for row in rows]
+
+    def movie_subjects_for_meta(self) -> list[dict]:
+        """记录、豆列、计划中出现过的全部影视（去重），用于补全时长。"""
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT subject_id, MAX(title) AS title, MAX(intro) AS intro FROM (
+                    SELECT subject_id, title, intro FROM records
+                    WHERE media_type='movie' AND deleted_at=''
+                    UNION ALL
+                    SELECT i.subject_id, i.title, i.intro FROM doulist_items i
+                    JOIN doulists d ON d.id=i.doulist_id AND d.deleted_at=''
+                    WHERE i.media_type='movie'
+                    UNION ALL
+                    SELECT subject_id, title, '' AS intro FROM plan_items
+                    WHERE media_type='movie' AND deleted_at=''
+                )
+                GROUP BY subject_id
+                ORDER BY title
+            """).fetchall()
+        return [{'subject_id': str(row['subject_id']), 'title': row['title'] or '',
+                 'intro': row['intro'] or ''} for row in rows]
 
     def set_word_count(self, record_id: int, word_count: int, book_file: str = '') -> None:
         with self._connect() as conn:
@@ -1168,6 +1275,22 @@ class Database:
                     updated_at=excluded.updated_at
             ''', (str(subject_id), max(0, int(pages or 0)), 1 if manual else 0, _now()))
 
+    def doulist_item_meta_entries(self) -> list[dict]:
+        """豆列条目自带页数/时长时，可作为书籍页数、影片时长的来源。"""
+        with self._connect() as conn:
+            rows = conn.execute('''
+                SELECT i.media_type, i.subject_id,
+                       MAX(i.duration_minutes) AS duration_minutes, MAX(i.pages) AS pages
+                FROM doulist_items i
+                JOIN doulists d ON d.id=i.doulist_id AND d.deleted_at=''
+                WHERE i.duration_minutes>0 OR i.pages>0
+                GROUP BY i.media_type, i.subject_id
+            ''').fetchall()
+        return [{'media_type': str(row['media_type']),
+                 'subject_id': str(row['subject_id']),
+                 'duration_minutes': int(row['duration_minutes'] or 0),
+                 'pages': int(row['pages'] or 0)} for row in rows]
+
     def import_book_pages(self, entries: Iterable[dict]) -> int:
         """把本机缓存里的历史页数首次写进数据库；已有记录不覆盖。"""
         now = _now()
@@ -1185,6 +1308,49 @@ class Database:
                       1 if entry.get('pages_manual') else 0, now))
                 saved += max(0, cursor.rowcount)
         return saved
+
+    def movie_duration_entries(self) -> list[dict]:
+        """已固化的影片时长，随数据库快照一起同步（与书籍页数同一套思路）。"""
+        with self._connect() as conn:
+            rows = conn.execute('''
+                SELECT subject_id, duration_minutes, duration_manual FROM movie_meta
+                WHERE duration_minutes>0 OR duration_manual=1
+                ORDER BY subject_id
+            ''').fetchall()
+        return [{'subject_id': str(row['subject_id']),
+                 'duration_minutes': int(row['duration_minutes'] or 0),
+                 'duration_manual': bool(row['duration_manual'])} for row in rows]
+
+    def set_movie_duration(self, subject_id: str, minutes: Optional[int],
+                           manual: bool = False) -> None:
+        minutes = max(0, int(minutes or 0))
+        with self._connect() as conn:
+            existing = conn.execute(
+                'SELECT duration_minutes, duration_manual FROM movie_meta WHERE subject_id=?',
+                (str(subject_id),),
+            ).fetchone()
+            # 值没变化就不写：避免每次备份/恢复都把状态指纹改掉。
+            if existing and int(existing[0]) == minutes and bool(existing[1]) == bool(manual):
+                return
+            if manual:
+                conn.execute('''
+                    INSERT INTO movie_meta(subject_id, duration_minutes, duration_manual, updated_at)
+                    VALUES (?, ?, 1, ?)
+                    ON CONFLICT(subject_id) DO UPDATE SET
+                        duration_minutes=excluded.duration_minutes,
+                        duration_manual=1,
+                        updated_at=excluded.updated_at
+                ''', (str(subject_id), minutes, _now()))
+                return
+            # 抓取到的时长不覆盖手动值。
+            conn.execute('''
+                INSERT INTO movie_meta(subject_id, duration_minutes, duration_manual, updated_at)
+                VALUES (?, ?, 0, ?)
+                ON CONFLICT(subject_id) DO UPDATE SET
+                    duration_minutes=CASE WHEN movie_meta.duration_manual=1
+                        THEN movie_meta.duration_minutes ELSE excluded.duration_minutes END,
+                    updated_at=excluded.updated_at
+            ''', (str(subject_id), minutes, _now()))
 
     def doulist_book_entries(self) -> list[sqlite3.Row]:
         with self._connect() as conn:
