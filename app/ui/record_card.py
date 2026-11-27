@@ -18,7 +18,7 @@ from qfluentwidgets import (
 
 from app.config import CACHE_DIR, MEDIA_LABELS, ROOT
 from app.cover_sync import is_custom_cover
-from app.media_meta import book_stats_text, movie_stats_text
+from app.media_meta import book_stats_text_full, movie_stats_text
 
 
 def _two_line_text(text: str, font, width: int) -> str:
@@ -311,7 +311,7 @@ class RecordCard(CardWidget):
         layout.addWidget(title)
 
         if record['media_type'] == 'book':
-            stats = book_stats_text(record['subject_id'], int(record['word_count'] or 0))
+            stats = book_stats_text_full(record['subject_id'], int(record['word_count'] or 0))
         else:
             stats = movie_stats_text(record['intro'] or '', record['subject_id'])
         stats_label = CaptionLabel(stats, self)
@@ -433,7 +433,7 @@ class RecordCard(CardWidget):
         )
         self.title_label.setToolTip(record['title'] or '')
         if record['media_type'] == 'book':
-            stats = book_stats_text(
+            stats = book_stats_text_full(
                 record['subject_id'], int(record['word_count'] or 0)
             )
         else:

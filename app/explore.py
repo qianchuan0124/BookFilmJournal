@@ -132,6 +132,33 @@ def _normalize_site(raw: dict) -> Optional[dict]:
     }
 
 
+def _site_key(url: str) -> str:
+    """站点去重键：忽略大小写与结尾斜杠。"""
+    return str(url or '').strip().rstrip('/').lower()
+
+
+def dedupe_sites(sites: list[dict]) -> list[dict]:
+    """按链接去重；重复项合并字段，任意一项是本地站点就保留本地标记。"""
+    kept: list[dict] = []
+    index: dict[str, dict] = {}
+    for site in sites:
+        key = _site_key(site.get('url'))
+        if not key:
+            continue
+        current = index.get(key)
+        if current is None:
+            index[key] = site
+            kept.append(site)
+            continue
+        if site.get('local'):
+            current['local'] = True
+        if not current.get('search_url') and site.get('search_url'):
+            current['search_url'] = site['search_url']
+        if not current.get('name') and site.get('name'):
+            current['name'] = site['name']
+    return kept
+
+
 _default_cache: Optional[dict] = None
 
 
@@ -155,6 +182,12 @@ def load_state(db) -> dict:
         # 首次使用只返回内置站点，不立即写库，避免无意义地产生一次数据变更。
         data = _default_state()
         sites = data['sites']
+    deduped = dedupe_sites(sites)
+    if len(deduped) != len(sites):
+        # 历史数据里可能有同一链接的本地与远端副本，顺手收敛并写回。
+        data['sites'] = deduped
+        save_state(db, data)
+        sites = deduped
     data['sites'] = sites
     return data
 
@@ -238,13 +271,15 @@ def pull_remote(timeout: float = 10) -> tuple[dict, str]:
 
 
 def merge_remote(state: dict, config: dict) -> int:
-    """用远端配置更新非本地站点，保留用户调整过的顺序。
+    """用远端配置更新站点：非本地站点按配置顺序排列，本地站点保持原位。
 
-    已在配置里的站点沿用现有位置与 id（只刷新名称、链接与搜索模板），远端新增的
-    站点追加到末尾，远端已删除的站点移除；本地站点原样保留。
+    已在配置里的站点沿用现有 id（刷新名称、链接与搜索模板），远端新增的按配置
+    顺序插入、已删除的移除；用户自己的本地站点停在原位置。同一链接的本地副本
+    与远端站点会合并成一条，避免出现重复。
     """
-    remote_items = []
+    remote_items: list[dict] = []
     version = config.get('version')
+    seen: set[str] = set()
     for key, kind in (('movie', MOVIE), ('book', BOOK)):
         for item in config.get(key) or []:
             normalized = _normalize_site({
@@ -254,27 +289,47 @@ def merge_remote(state: dict, config: dict) -> int:
                 'kind': kind,
                 'local': False,
             })
-            if normalized:
-                remote_items.append(normalized)
-    remote_by_url = {item['url']: item for item in remote_items}
+            if not normalized:
+                continue
+            site_key = _site_key(normalized['url'])
+            if site_key in seen:
+                continue
+            seen.add(site_key)
+            remote_items.append(normalized)
 
-    sites = []
-    kept_urls = set()
-    for site in state.get('sites') or []:
-        if site.get('local'):
-            sites.append(site)
-            continue
-        item = remote_by_url.get(site.get('url') or '')
-        if item is None:
+    old_sites = dedupe_sites(state.get('sites') or [])
+    old_by_key = {_site_key(site.get('url')): site for site in old_sites}
+
+    ordered = []
+    for item in remote_items:
+        site = old_by_key.get(_site_key(item['url']))
+        if site is None:
+            ordered.append(item)
             continue
         site['name'] = item['name']
-        site['search_url'] = item['search_url']
+        if item['search_url']:
+            site['search_url'] = item['search_url']
         site['kind'] = item['kind']
-        sites.append(site)
-        kept_urls.add(item['url'])
-    for item in remote_items:
-        if item['url'] not in kept_urls:
+        ordered.append(site)
+
+    # 不在配置里的本地站点按原来的下标插回去，其余位置依次填配置顺序。
+    leftover_locals = {index: site for index, site in enumerate(old_sites)
+                       if site.get('local') and _site_key(site.get('url')) not in seen}
+
+    sites: list[dict] = []
+    pending = iter(ordered)
+    total = max(len(old_sites), len(ordered) + len(leftover_locals))
+    for index in range(total):
+        local_site = leftover_locals.get(index)
+        if local_site is not None:
+            sites.append(local_site)
+            continue
+        item = next(pending, None)
+        if item is not None:
             sites.append(item)
+    sites.extend(pending)
+    placed = {id(site) for site in sites}
+    sites.extend(site for site in leftover_locals.values() if id(site) not in placed)
 
     state['sites'] = sites
     if isinstance(version, int):
@@ -372,29 +427,38 @@ def search_link(site: dict, title: str) -> str:
     return f'{template}&q={encoded}'
 
 
-def _looks_like_challenge(response) -> bool:
-    """是否是 Cloudflare 之类的浏览器人机校验页。
+CHALLENGE_MARKERS = (
+    'just a moment',                  # Cloudflare 校验页标题
+    'challenges.cloudflare.com',
+    'cf-browser-verification',
+    'diamwall',                       # DiamWall 校验页（Z-Library 等站点在用）
+    'verifying your browser',
+)
 
-    这类页面用浏览器能正常打开，但纯 HTTP 请求会拿到 403/503 和「Just a moment...」，
+
+def _looks_like_challenge(response) -> bool:
+    """是否是 Cloudflare / DiamWall 之类的浏览器人机校验页。
+
+    这类页面用浏览器能正常打开，但纯 HTTP 请求会拿到 403/5xx 和校验页，
     不能据此判定站点不可访问。
     """
     if (response.headers.get('cf-mitigated') or '').lower() == 'challenge':
         return True
-    if response.status_code not in (403, 503):
-        return False
+    # DiamWall 用自定义状态码 513 + Server: DiamWall 返回校验页。
+    if 'diamwall' in (response.headers.get('Server') or '').lower():
+        return True
     try:
-        head = response.text[:2048].lower()
+        head = response.content[:4096].decode('utf-8', 'ignore').lower()
     except (AttributeError, requests.RequestException):
         return False
-    return ('just a moment' in head or 'challenges.cloudflare.com' in head
-            or 'cf-browser-verification' in head)
+    return any(marker in head for marker in CHALLENGE_MARKERS)
 
 
 def check_site(url: str, timeout: float = 6) -> bool:
     """连通性检测：能拿到 HTTP 响应即视为可达。
 
     只把 DNS / TLS / 连接失败、超时和 5xx 当作不可达；403 之类的拒绝、以及
-    Cloudflare 人机校验都说明服务器在线，浏览器打开没有问题。
+    Cloudflare / DiamWall 人机校验都说明服务器在线，浏览器打开没有问题。
     """
     try:
         response = requests.get(

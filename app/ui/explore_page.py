@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QUrl, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor, QDesktopServices, QPainter, QPainterPath, QPen,
 )
@@ -279,6 +279,10 @@ class ExplorePage(QWidget):
         self.status: dict[str, bool] = {}
         self.pull_worker = None
         self.check_worker = None
+        self._auto_checked = False
+        self._check_pending = False
+        # 启动后稍等界面就绪再检测，避免和首屏渲染、封面加载抢资源。
+        QTimer.singleShot(1200, self.auto_check)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(32, 26, 32, 0)
@@ -359,7 +363,7 @@ class ExplorePage(QWidget):
             self.body.addWidget(card)
 
         tips = CaptionLabel('点击任意站点复制完整链接；点击 ↑ / ↓ 调整顺序；'
-                            '「拉取」从远端更新站点（保留本地顺序），'
+                            '「拉取」从远端更新站点并按配置顺序排列（本地站点保持原位），'
                             '「检查连通性」只检测不改配置。', self.container)
         tips.setWordWrap(True)
         tips.setTextColor('#5f6b7a', '#8d95a5')
@@ -398,6 +402,15 @@ class ExplorePage(QWidget):
         status_row.addWidget(self.config_status)
         layout.addLayout(status_row)
         return card
+
+    def auto_check(self) -> None:
+        """应用启动后自动检测一次连通性（不依赖是否进入本页）。"""
+        if self._auto_checked:
+            return
+        if not (self.state.get('sites') or []):
+            return
+        self._auto_checked = True
+        self.check_connectivity()
 
     def _refresh_hint(self) -> None:
         sites = self.state.get('sites') or []
@@ -479,6 +492,8 @@ class ExplorePage(QWidget):
 
     def check_connectivity(self) -> None:
         if self.check_worker is not None and self.check_worker.isRunning():
+            # 已有检测在跑：记下来，等它结束后用最新站点再检测一遍。
+            self._check_pending = True
             return
         sites = self.state.get('sites') or []
         if not sites:
@@ -488,8 +503,14 @@ class ExplorePage(QWidget):
         self.check_worker = _CheckWorker(sites, self)
         self.check_worker.progress.connect(self._on_check_progress)
         self.check_worker.done.connect(self._on_checked)
-        self.check_worker.finished.connect(lambda: self.check_button.setEnabled(True))
+        self.check_worker.finished.connect(self._on_check_finished)
         self.check_worker.start()
+
+    def _on_check_finished(self) -> None:
+        self.check_button.setEnabled(True)
+        if self._check_pending:
+            self._check_pending = False
+            self.check_connectivity()
 
     def _on_check_progress(self, done: int, total: int) -> None:
         self.hint_label.setText(f'检测中… {done}/{total}')

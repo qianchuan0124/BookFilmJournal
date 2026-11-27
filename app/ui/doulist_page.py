@@ -15,7 +15,7 @@ from qfluentwidgets import (
 
 from app.config import MEDIA_LABELS, MEDIA_NOUNS, READ_LABELS, ROOT
 from app.db import Database
-from app.media_meta import book_stats_text, movie_stats_text
+from app.media_meta import book_stats_text_full, movie_stats_text
 from app.ui.dialogs import MediaMetaDialog, SyncDialog
 from app.ui.read_stamp import ReadStamp
 from app.ui.record_card import _cover_pixmap, _two_line_text
@@ -191,8 +191,8 @@ class DoulistDetailRow(QFrame):
         subtitle.setTextColor('#5f6b7a', '#8d95a5')
         info.addWidget(subtitle)
         if item['media_type'] == 'book':
-            stats = book_stats_text(item['subject_id'],
-                                    word_counts.get(str(item['subject_id']), 0))
+            stats = book_stats_text_full(item['subject_id'],
+                                         word_counts.get(str(item['subject_id']), 0))
         elif item['media_type'] == 'movie':
             intro = item['intro'] or movie_intros.get(str(item['subject_id']), '')
             stats = movie_stats_text(intro, item['subject_id'])

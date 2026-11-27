@@ -34,7 +34,7 @@ from app.douban import (
 )
 from app.cover_sync import is_custom_cover
 from app.media_meta import (
-    book_pages, book_stats_text, manual_movie_duration, movie_duration,
+    book_pages, book_stats_text_full, manual_movie_duration, movie_duration,
     movie_stats_text, parse_duration, set_book_pages, set_movie_duration,
 )
 from app.ui.record_card import _cover_pixmap
@@ -699,7 +699,7 @@ class RecordDetailDialog(MessageBoxBase):
         date = record['effective_date'] or record['marked_date'] or '未设置'
         stats = ''
         if media_type == 'book':
-            stats = book_stats_text(record['subject_id'], int(record['word_count'] or 0))
+            stats = book_stats_text_full(record['subject_id'], int(record['word_count'] or 0))
         else:
             stats = movie_stats_text(record['intro'] or '', record['subject_id'])
         for text in (
