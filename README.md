@@ -77,7 +77,7 @@
 
 <img src="./docs/images/guide-explore.png" width="860" alt="探索空间">
 
-资源站点由远端配置下发（GitHub 失败自动回退 Gitee），也可以添加自己的本地站点；支持一键拉取配置（按配置顺序排列，本地站点保持原位）、上下移动排序、连通性检测（启动后自动跑一次，Cloudflare / DiamWall 人机校验页按可达处理），点击站点复制链接。
+资源站点由远端配置下发（GitHub 失败自动回退 Gitee），也可以添加自己的本地站点；支持一键拉取配置（按配置顺序排列，本地站点保持原位）、上下移动排序、连通性检测（启动后自动跑一次，结束时在窗口右上角提示结果，Cloudflare / DiamWall 人机校验页按可达处理），点击站点复制链接。
 
 <img src="./docs/images/guide-explore-2.png" width="860" alt="记录详情 · 站点跳转">
 
@@ -99,9 +99,11 @@
 
 | 平台 | 文件 | 说明 |
 | --- | --- | --- |
-| macOS | `ShuyingJilu-mac.dmg` | 拖入「应用程序」即可 |
-| macOS | `ShuyingJilu-mac.zip` | 解压后双击「书影记录.app」 |
-| Windows | `ShuyingJilu-win.zip` | 解压后运行 `ShuyingJilu.exe` |
+| macOS | `ShuyingJilu-<版本>-macos-<架构>.dmg` | 拖入「应用程序」即可 |
+| macOS | `ShuyingJilu-<版本>-macos-<架构>.zip` | 解压后双击「书影记录.app」 |
+| macOS | `ShuyingJilu-<版本>-INSTALL.txt` | 安装 / 升级说明，随包生成 |
+| Windows | `ShuyingJilu-<版本>-windows-x64.zip` | 解压后运行 `ShuyingJilu.exe` |
+| Windows | `ShuyingJilu-<版本>-windows-x64-setup.exe` | 安装包 |
 
 macOS 包为 ad-hoc 签名，未做 Apple 公证；首次打开如被 Gatekeeper 拦截，右键选择「打开」。Windows 包未做代码签名，SmartScreen 可能会提示。
 
@@ -135,7 +137,8 @@ packaging\build_windows.bat --portable-only
 
 - macOS App 约 565 MB，ZIP 约 204 MB，DMG 约 240–255 MB；体积主要来自 `QtWebEngineCore`（约 290 MB）及 Chromium 运行资源，用于内置扫码登录。
 - PyInstaller 不支持从 macOS 交叉编译 Windows 包，需要在 Windows 10/11 上执行。
-- Windows 产物：便携目录 `dist\ShuyingJilu\`、便携 zip `dist\ShuyingJilu-win.zip`、安装包 `dist\ShuyingJilu-win.setup.exe`。
+- macOS 产物：`dist/release/` 下的 `ShuyingJilu-<版本>-macos-<架构>.dmg`、`ShuyingJilu-<版本>-macos-<架构>.zip` 与 `ShuyingJilu-<版本>-INSTALL.txt`。
+- Windows 产物：便携目录 `dist\ShuyingJilu\`、便携 zip `dist\ShuyingJilu-<版本>-windows-x64.zip`、安装包 `dist\ShuyingJilu-<版本>-windows-x64-setup.exe`。
 - 安装包由 Inno Setup 6 编译（脚本 `packaging\ShuyingJilu.iss`），需先安装 Inno Setup 6 并确保 `ISCC.exe` 可用；安装到当前用户目录，无需管理员权限，安装时可选桌面快捷方式。
 
 ```bash

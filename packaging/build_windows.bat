@@ -36,10 +36,22 @@ if not exist "dist\ShuyingJilu\ShuyingJilu.exe" (
   exit /b 1
 )
 
-set ZIP=dist\ShuyingJilu-win.zip
+rem 版本号走临时文件：for /f 里嵌套引号会被 cmd 的错误引号规则吞掉，导致读到空版本
+set "APP_VERSION="
+".venv\Scripts\python.exe" -c "import sys;sys.path.insert(0,'.');from app.config import APP_VERSION;print(APP_VERSION)" > "%TEMP%\bfj_version.txt" 2>nul
+if exist "%TEMP%\bfj_version.txt" set /p APP_VERSION=<"%TEMP%\bfj_version.txt"
+del /f /q "%TEMP%\bfj_version.txt" 2>nul
+if not defined APP_VERSION (
+  echo 无法读取应用版本号（app\config.py 的 APP_VERSION），已停止打包。
+  exit /b 1
+)
+rem 产物统一命名：ShuyingJilu-<版本>-windows-x64[-setup]，纯 ASCII。
+set "PACKAGE_NAME=ShuyingJilu-%APP_VERSION%-windows-x64"
+
+set "ZIP=dist\%PACKAGE_NAME%.zip"
 if exist "%ZIP%" del /f /q "%ZIP%"
 rem Compress-Archive 在文件被占用时会静默失败，改用 .NET ZipFile 并在出错时返回非零退出码
-powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory('%CD%\dist\ShuyingJilu','%CD%\dist\ShuyingJilu-win.zip',[System.IO.Compression.CompressionLevel]::Optimal,$false)"
+powershell -NoProfile -Command "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::CreateFromDirectory('%CD%\dist\ShuyingJilu','%CD%\%ZIP%',[System.IO.Compression.CompressionLevel]::Optimal,$false)"
 if errorlevel 1 exit /b 1
 if not exist "%ZIP%" (
   echo 未生成 Windows 便携包：%ZIP%
@@ -63,20 +75,13 @@ if not defined ISCC (
   exit /b 1
 )
 
-rem 版本号走临时文件：for /f 里嵌套引号会被 cmd 的错误引号规则吞掉，导致读到空版本
-set "APP_VERSION="
-".venv\Scripts\python.exe" -c "import sys;sys.path.insert(0,'.');from app.config import APP_VERSION;print(APP_VERSION)" > "%TEMP%\bfj_version.txt" 2>nul
-if exist "%TEMP%\bfj_version.txt" set /p APP_VERSION=<"%TEMP%\bfj_version.txt"
-del /f /q "%TEMP%\bfj_version.txt" 2>nul
-set "VER_ARG="
-if defined APP_VERSION set "VER_ARG=/DMyAppVersion=%APP_VERSION%"
-if not defined VER_ARG echo 未读取到应用版本号，安装包将使用 ShuyingJilu.iss 里的默认值。
+set "VER_ARG=/DMyAppVersion=%APP_VERSION%"
 
 "%ISCC%" %VER_ARG% packaging\ShuyingJilu.iss
 if errorlevel 1 exit /b 1
 
-if not exist "dist\ShuyingJilu-win.setup.exe" (
-  echo 未生成 Windows 安装包：dist\ShuyingJilu-win.setup.exe
+if not exist "dist\%PACKAGE_NAME%-setup.exe" (
+  echo 未生成 Windows 安装包：dist\%PACKAGE_NAME%-setup.exe
   exit /b 1
 )
-echo Windows 安装包已生成：dist\ShuyingJilu-win.setup.exe
+echo Windows 安装包已生成：dist\%PACKAGE_NAME%-setup.exe

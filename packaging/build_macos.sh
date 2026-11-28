@@ -28,10 +28,10 @@ fi
 codesign --force --deep --sign - "$APP" || true
 rm -rf dist/ShuyingJilu
 
-# 版本号取自 app/config.py，发布包按「书影记录-<版本>-<架构>」命名，便于内网分发。
+# 版本号取自 app/config.py，发布包统一按「ShuyingJilu-<版本>-macos-<架构>」命名（纯 ASCII）。
 VERSION="$(.venv/bin/python -c 'from app.config import APP_VERSION; print(APP_VERSION)')"
 ARCH="$(uname -m)"
-NAME="书影记录-${VERSION}-${ARCH}"
+NAME="ShuyingJilu-${VERSION}-macos-${ARCH}"
 RELEASE="dist/release"
 rm -rf "$RELEASE"
 mkdir -p "$RELEASE"
@@ -198,7 +198,8 @@ else
 fi
 hdiutil verify "$OUT_DMG" >/dev/null
 
-sed "s/__VERSION__/${VERSION}/g" packaging/安装说明.txt > "$RELEASE/书影记录-安装说明.txt"
+sed "s/__VERSION__/${VERSION}/g" packaging/install_notes.txt \
+  > "$RELEASE/ShuyingJilu-${VERSION}-INSTALL.txt"
 
 echo "内网分发包已生成（${RELEASE}）："
 ls -lh "$RELEASE"

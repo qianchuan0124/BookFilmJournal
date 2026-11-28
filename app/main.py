@@ -34,6 +34,7 @@ from qfluentwidgets.components.date_time.calendar_view import DayScrollView, Mon
 from app.db import Database
 from app.profile import migrate_legacy_profile
 from app.single_instance import acquire as acquire_single_instance
+from app.ui.connectivity import service as connectivity_service
 from app.ui.main_window import MainWindow
 from app.ui.styles import install_flat_buttons
 
@@ -95,4 +96,6 @@ def main() -> None:
     setThemeColor('#e5b45f')
     window = MainWindow(db)
     window.show()
+    # 退出时让后台连通性检测线程收尾，避免 QThread 在运行中被销毁。
+    app.aboutToQuit.connect(connectivity_service().shutdown)
     sys.exit(app.exec())

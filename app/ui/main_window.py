@@ -17,6 +17,7 @@ from app.ui.plan_page import PlanPage
 from app.ui.data_page import DataPage
 from app.ui.recycle_page import RecyclePage
 from app.ui.explore_page import ExplorePage
+from app.ui.connectivity import service as connectivity_service
 
 
 # 页面首次点开时才实例化：一次性建 8 个页面要 200 多毫秒，多数页面启动时用不上。
@@ -95,6 +96,9 @@ class MainWindow(FluentWindow):
         self.move(screen.center() - self.rect().center())
         # 启动后稍等界面就绪，再尝试自动同步云端最新快照。
         QTimer.singleShot(1800, self._run_auto_sync)
+        # 同时后台检测一次探索空间站点连通性，进不出「探索空间」页都能拿到最新结果。
+        QTimer.singleShot(1500, self._check_explore_connectivity)
+        connectivity_service().finished.connect(self._on_connectivity_finished)
 
     def _on_theme_changed(self) -> None:
         for name in ('movie_page', 'book_page'):
@@ -155,6 +159,29 @@ class MainWindow(FluentWindow):
             page = self._pages.get('data_page')
             if page is not None:
                 page.refresh_sync()
+
+    def _check_explore_connectivity(self) -> None:
+        """启动后自动检测探索空间站点连通性（后台线程，不阻塞首屏）。"""
+        try:
+            connectivity_service().start(db=self.db)
+        except Exception:
+            # 检测失败不影响主流程，用户仍可在探索空间里手动重试。
+            pass
+
+    def _on_connectivity_finished(self, result: dict) -> None:
+        """检测结束后的全局提示：不管当前停在哪个页面都能看到。"""
+        if not result:
+            return
+        total = len(result)
+        reachable = sum(1 for value in result.values() if value)
+        if reachable == total:
+            InfoBar.success('连通性检测完成', f'{total} 个站点全部可访问',
+                            parent=self, position=InfoBarPosition.TOP_RIGHT,
+                            duration=5000)
+        else:
+            InfoBar.warning('连通性检测完成', f'{reachable}/{total} 个站点可访问',
+                            parent=self, position=InfoBarPosition.TOP_RIGHT,
+                            duration=5000)
 
     def _run_auto_sync(self) -> None:
         result = auto_restore(self.db)

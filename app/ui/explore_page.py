@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QUrl, Signal
 from PySide6.QtGui import (
     QColor, QDesktopServices, QPainter, QPainterPath, QPen,
 )
@@ -19,6 +19,7 @@ from qfluentwidgets import (
 
 from app import explore
 from app.db import Database
+from app.ui.connectivity import service as connectivity_service
 
 
 class _ElidedLabel(QLabel):
@@ -52,22 +53,6 @@ class _PullWorker(QThread):
             self.done.emit(config, source)
         except Exception as exc:  # noqa: BLE001 - 网络异常统一提示
             self.failed.emit(str(exc))
-
-
-class _CheckWorker(QThread):
-    progress = Signal(int, int)
-    done = Signal(object)
-
-    def __init__(self, sites: list[dict], parent=None):
-        super().__init__(parent)
-        self._sites = sites
-
-    def run(self) -> None:
-        result = explore.check_all(
-            self._sites,
-            progress=lambda done, total: self.progress.emit(done, total),
-        )
-        self.done.emit(result)
 
 
 class _StatusMark(QWidget):
@@ -276,13 +261,18 @@ class ExplorePage(QWidget):
         self.db = db
         self.setObjectName('explorePage')
         self.state = explore.load_state(db)
+        # 复用启动时（或上一次）检测到的结果，页面一打开就能显示圆点。
         self.status: dict[str, bool] = {}
+        for site in self.state.get('sites') or []:
+            reachable = explore.get_reachability(site.get('id'))
+            if reachable is not None:
+                self.status[site['id']] = reachable
         self.pull_worker = None
-        self.check_worker = None
-        self._auto_checked = False
-        self._check_pending = False
-        # 启动后稍等界面就绪再检测，避免和首屏渲染、封面加载抢资源。
-        QTimer.singleShot(1200, self.auto_check)
+        self._pending_check = False
+        self._service = connectivity_service()
+        self._service.started.connect(self._on_check_started)
+        self._service.progress.connect(self._on_check_progress)
+        self._service.finished.connect(self._on_checked)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(32, 26, 32, 0)
@@ -322,6 +312,9 @@ class ExplorePage(QWidget):
         outer.addWidget(self.scroll, 1)
 
         self._build()
+        if self._service.is_running():
+            self.check_button.setEnabled(False)
+            self.hint_label.setText('检测中…')
         qconfig.themeChangedFinished.connect(self._on_theme_changed)
 
     # ---------- 界面 ----------
@@ -403,15 +396,6 @@ class ExplorePage(QWidget):
         layout.addLayout(status_row)
         return card
 
-    def auto_check(self) -> None:
-        """应用启动后自动检测一次连通性（不依赖是否进入本页）。"""
-        if self._auto_checked:
-            return
-        if not (self.state.get('sites') or []):
-            return
-        self._auto_checked = True
-        self.check_connectivity()
-
     def _refresh_hint(self) -> None:
         sites = self.state.get('sites') or []
         total = len(sites)
@@ -491,37 +475,35 @@ class ExplorePage(QWidget):
                       position=InfoBarPosition.TOP, duration=6000)
 
     def check_connectivity(self) -> None:
-        if self.check_worker is not None and self.check_worker.isRunning():
-            # 已有检测在跑：记下来，等它结束后用最新站点再检测一遍。
-            self._check_pending = True
-            return
+        """手动检测：交给全局服务；若已有检测在跑，等它结束后用最新站点补测一次。"""
         sites = self.state.get('sites') or []
         if not sites:
             return
         self.check_button.setEnabled(False)
         self.hint_label.setText('检测中…')
-        self.check_worker = _CheckWorker(sites, self)
-        self.check_worker.progress.connect(self._on_check_progress)
-        self.check_worker.done.connect(self._on_checked)
-        self.check_worker.finished.connect(self._on_check_finished)
-        self.check_worker.start()
+        if self._service.is_running():
+            self._pending_check = True
+            return
+        self._service.start(sites=sites)
 
-    def _on_check_finished(self) -> None:
-        self.check_button.setEnabled(True)
-        if self._check_pending:
-            self._check_pending = False
-            self.check_connectivity()
+    def _on_check_started(self) -> None:
+        self.check_button.setEnabled(False)
+        self.hint_label.setText('检测中…')
 
     def _on_check_progress(self, done: int, total: int) -> None:
         self.hint_label.setText(f'检测中… {done}/{total}')
 
     def _on_checked(self, result: dict) -> None:
         self.status.update({key: bool(value) for key, value in result.items()})
-        explore.set_reachability(result)
         for site_id, row in self.rows.items():
             if site_id in self.status:
                 row.set_status(self.status[site_id])
+        self.check_button.setEnabled(True)
         self._refresh_hint()
+        if self._pending_check:
+            # 检测期间站点被增删或重新拉取过：用最新站点再补测一次。
+            self._pending_check = False
+            self.check_connectivity()
 
     def _on_theme_changed(self) -> None:
         # 行内链接颜色跟随主题，重建一次即可

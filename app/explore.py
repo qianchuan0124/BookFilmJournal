@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -477,22 +477,48 @@ def check_site(url: str, timeout: float = 6) -> bool:
 
 
 def check_all(sites: list[dict], timeout: float = 6, workers: int = 4,
-              progress: Optional[Callable[[int, int], None]] = None) -> dict[str, bool]:
-    """并发检测站点连通性（最多 4 个并发）。"""
+              progress: Optional[Callable[[int, int], None]] = None,
+              should_stop: Optional[Callable[[], bool]] = None) -> dict[str, bool]:
+    """并发检测站点连通性（最多 4 个并发）。
+
+    用守护线程而不是线程池：应用退出时线程随进程结束，不会卡住退出流程。
+    progress 在工作线程里被调用，只适合转发信号（如 Qt 的 Signal.emit）；
+    should_stop 返回 True 后不再领取新站点，便于退出时尽快收尾。
+    """
     result: dict[str, bool] = {}
     total = len(sites)
-    done = 0
-    if not sites:
+    if not total or (should_stop and should_stop()):
         return result
-    with ThreadPoolExecutor(max_workers=max(1, min(4, workers))) as pool:
-        futures = {pool.submit(check_site, site['url'], timeout): site for site in sites}
-        for future in futures:
-            site = futures[future]
+
+    lock = threading.Lock()
+    cursor = 0
+    done = 0
+
+    def worker() -> None:
+        nonlocal cursor, done
+        while True:
+            if should_stop and should_stop():
+                return
+            with lock:
+                if cursor >= total:
+                    return
+                site = sites[cursor]
+                cursor += 1
             try:
-                result[site['id']] = bool(future.result())
+                ok = check_site(site['url'], timeout)
             except Exception:
-                result[site['id']] = False
-            done += 1
+                ok = False
+            with lock:
+                result[site['id']] = bool(ok)
+                done += 1
+                current = done
             if progress:
-                progress(done, total)
+                progress(current, total)
+
+    count = max(1, min(4, workers, total))
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
     return result

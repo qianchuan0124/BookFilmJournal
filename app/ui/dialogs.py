@@ -38,6 +38,7 @@ from app.media_meta import (
     book_pages, book_stats_text_full, manual_movie_duration, movie_duration,
     movie_stats_text, parse_duration, set_book_pages, set_movie_duration,
 )
+from app.ui.connectivity import service as connectivity_service
 from app.ui.record_card import _cover_pixmap
 from app.ui.styles import (
     cover_placeholder_style, divider_style, input_style, primary_button,
@@ -502,10 +503,18 @@ def _populate_resources(grid: QGridLayout, title_label, box: QWidget, db: Databa
     if not sites:
         return
     keyword = (title or '').split(' / ')[0].strip()
+    checking = connectivity_service().is_running()
     for index, site in enumerate(sites):
         status = explore.get_reachability(site['id'])
-        mark = '✓' if status is True else '✕' if status is False else '·'
-        state_text = '可访问' if status is True else '不可访问' if status is False else '未检测'
+        if checking:
+            # 检测进行中：提示「检测中」，避免把上一轮结果当成当前状态。
+            mark, state_text = '·', '检测中…'
+        elif status is True:
+            mark, state_text = '✓', '可访问'
+        elif status is False:
+            mark, state_text = '✕', '不可访问'
+        else:
+            mark, state_text = '·', '未检测'
         button = PushButton(f'{mark} {site["name"]}', box)
         button.setMinimumHeight(34)
         button.setToolTip(f'{site["url"]}\n状态：{state_text}')
@@ -687,6 +696,11 @@ class RecordDetailDialog(MessageBoxBase):
         body.addWidget(right_widget, 2)
         self.viewLayout.addLayout(body)
 
+        # 检测开始/结束时刷新资源按钮的圆点与悬浮提示（弹窗常开着检测才结束）。
+        self._connectivity = connectivity_service()
+        self._connectivity.started.connect(self._on_connectivity_changed)
+        self._connectivity.finished.connect(self._on_connectivity_changed)
+
         self._refresh()
         self._fit_height()
 
@@ -754,6 +768,10 @@ class RecordDetailDialog(MessageBoxBase):
         """按记录类型展示探索空间站点，并标注最近一次连通性检测结果。"""
         _populate_resources(self.resource_grid, self.resource_title, self.resource_box,
                             self.db, self.record['media_type'], self.record['title'] or '')
+
+    def _on_connectivity_changed(self, *_args) -> None:
+        if self.isVisible():
+            self._refresh_resources()
 
     def _change_cover(self) -> None:
         dialog = CoverChangeDialog(self.db, self.record, self)
@@ -884,11 +902,21 @@ class ItemDetailDialog(MessageBoxBase):
         self.resource_grid.setHorizontalSpacing(8)
         self.resource_grid.setVerticalSpacing(12)
         right.addWidget(self.resource_box)
+        self._media_type = media_type
+        self._title = self.data.get('title') or ''
+        self._connectivity = connectivity_service()
+        self._connectivity.started.connect(self._on_connectivity_changed)
+        self._connectivity.finished.connect(self._on_connectivity_changed)
         _populate_resources(self.resource_grid, self.resource_title, self.resource_box,
-                            self.db, media_type, self.data.get('title') or '')
+                            self.db, media_type, self._title)
         body.addWidget(right_widget, 2)
         self.viewLayout.addLayout(body)
         self._fit_height()
+
+    def _on_connectivity_changed(self, *_args) -> None:
+        if self.isVisible():
+            _populate_resources(self.resource_grid, self.resource_title, self.resource_box,
+                                self.db, self._media_type, self._title)
 
     def _info_lines(self, media_type: str) -> list[str]:
         lines: list[str] = []

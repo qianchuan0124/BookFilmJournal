@@ -25,7 +25,8 @@ DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
-OutputBaseFilename=ShuyingJilu-win.setup
+; 产物统一命名：ShuyingJilu-<版本>-windows-x64-setup.exe（纯 ASCII）。
+OutputBaseFilename=ShuyingJilu-{#MyAppVersion}-windows-x64-setup
 SetupIconFile=icon.ico
 VersionInfoVersion={#MyAppVersion}
 VersionInfoDescription={#MyAppName} 安装程序
