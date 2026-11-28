@@ -27,6 +27,7 @@ from app import explore
 from app.calibre_install import install_calibre
 from app.config import (
     APP_VERSION, APP_VERSION_TEXT, COVERS_DIR, DB_PATH, MEDIA_LABELS, READ_LABELS, ROOT,
+    WISH_LABELS,
 )
 from app.db import Database
 from app.douban import (
@@ -487,6 +488,36 @@ class _CoverLabel(QLabel):
         self._fit()
 
 
+def _populate_resources(grid: QGridLayout, title_label, box: QWidget, db: Database,
+                        media_type: str, title: str) -> None:
+    """按条目类型列出探索空间站点并标注最近一次连通性检测结果（两个详情弹窗共用）。"""
+    while grid.count():
+        item = grid.takeAt(0)
+        widget = item.widget()
+        if widget is not None:
+            widget.deleteLater()
+    sites = explore.sites_for(explore.load_state(db), media_type)
+    title_label.setVisible(bool(sites))
+    box.setVisible(bool(sites))
+    if not sites:
+        return
+    keyword = (title or '').split(' / ')[0].strip()
+    for index, site in enumerate(sites):
+        status = explore.get_reachability(site['id'])
+        mark = '✓' if status is True else '✕' if status is False else '·'
+        state_text = '可访问' if status is True else '不可访问' if status is False else '未检测'
+        button = PushButton(f'{mark} {site["name"]}', box)
+        button.setMinimumHeight(34)
+        button.setToolTip(f'{site["url"]}\n状态：{state_text}')
+        button.clicked.connect(
+            lambda _checked=False, item=site, text=keyword: QDesktopServices.openUrl(
+                QUrl(explore.search_link(item, text))))
+        grid.addWidget(button, index // 3, index % 3)
+    rows = (len(sites) + 2) // 3
+    # 给资源块一个明确的最小高度，避免弹窗变矮时行距被压扁、按钮互相压住。
+    box.setMinimumHeight(rows * 34 + (rows - 1) * 12)
+
+
 class MediaMetaDialog(MessageBoxBase):
     def __init__(self, db: Database, media_type: str, subject_id: str, title: str,
                  intro: str = '', parent=None):
@@ -680,7 +711,10 @@ class RecordDetailDialog(MessageBoxBase):
     def _refresh(self) -> None:
         record = self.record
         media_type = record['media_type']
-        done_text = READ_LABELS.get(media_type, ('已读', '未读'))[0]
+        is_done = record['status'] == 'done'
+        done_text = READ_LABELS.get(media_type, ('已读', '未读'))[0 if is_done else 1]
+        if not is_done:
+            done_text = WISH_LABELS.get(media_type, done_text)
         self.title_label.setText(record['title'] or '')
         subtitle = f"{MEDIA_LABELS.get(media_type, '')} · {done_text}"
         if is_custom_cover(media_type, record['subject_id'], record['cover_path'] or ''):
@@ -704,7 +738,7 @@ class RecordDetailDialog(MessageBoxBase):
             stats = movie_stats_text(record['intro'] or '', record['subject_id'])
         for text in (
             f"我的评分：{'★' * rating}{'☆' * (5 - rating)}" if rating else '我的评分：未评分',
-            f"日期：{date}",
+            f"{'日期' if is_done else '标记日期'}：{date}",
             f"{'页数 / 字数' if media_type == 'book' else '时长'}：{stats}",
         ):
             label = BodyLabel(text, self)
@@ -718,32 +752,8 @@ class RecordDetailDialog(MessageBoxBase):
 
     def _refresh_resources(self) -> None:
         """按记录类型展示探索空间站点，并标注最近一次连通性检测结果。"""
-        while self.resource_grid.count():
-            item = self.resource_grid.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        media_type = self.record['media_type']
-        sites = explore.sites_for(explore.load_state(self.db), media_type)
-        self.resource_title.setVisible(bool(sites))
-        self.resource_box.setVisible(bool(sites))
-        if not sites:
-            return
-        title = (self.record['title'] or '').split(' / ')[0].strip()
-        for index, site in enumerate(sites):
-            status = explore.get_reachability(site['id'])
-            mark = '✓' if status is True else '✕' if status is False else '·'
-            state_text = '可访问' if status is True else '不可访问' if status is False else '未检测'
-            button = PushButton(f'{mark} {site["name"]}', self.resource_box)
-            button.setMinimumHeight(34)
-            button.setToolTip(f'{site["url"]}\n状态：{state_text}')
-            button.clicked.connect(
-                lambda _checked=False, item=site, text=title: QDesktopServices.openUrl(
-                    QUrl(explore.search_link(item, text))))
-            self.resource_grid.addWidget(button, index // 3, index % 3)
-        rows = (len(sites) + 2) // 3
-        # 给资源块一个明确的最小高度，避免弹窗变矮时行距被压扁、按钮互相压住。
-        self.resource_box.setMinimumHeight(rows * 34 + (rows - 1) * 12)
+        _populate_resources(self.resource_grid, self.resource_title, self.resource_box,
+                            self.db, self.record['media_type'], self.record['title'] or '')
 
     def _change_cover(self) -> None:
         dialog = CoverChangeDialog(self.db, self.record, self)
@@ -768,6 +778,171 @@ class RecordDetailDialog(MessageBoxBase):
     def validate(self) -> bool:
         self._edit()
         return False
+
+
+def open_record_detail(db: Database, record, parent=None) -> bool:
+    """打开记录详情弹窗，返回期间是否改过内容（编辑、换封面都算）。"""
+    dialog = RecordDetailDialog(db, record, parent)
+    changed: list[int] = []
+    dialog.changed.connect(changed.append)
+    dialog.exec()
+    return bool(changed)
+
+
+class ItemDetailDialog(MessageBoxBase):
+    """豆列 / 计划里还没有对应记录时的条目详情：只读展示，可跳到豆瓣。"""
+
+    def __init__(self, db: Database, item, parent=None, source_text: str = ''):
+        super().__init__(parent)
+        self.db = db
+        self.data = dict(item)
+        self.url = self.data.get('url') or ''
+        self.widget.setMinimumWidth(760)
+        self.viewLayout.setSpacing(12)
+        self.yesButton.setText('在豆瓣打开')
+        self.cancelButton.setText('关闭')
+        self.yesButton.setVisible(bool(self.url))
+
+        media_type = self.data.get('media_type') or 'movie'
+        status = self.data.get('status') or ''
+        done_text = READ_LABELS.get(media_type, ('已读', '未读'))[0 if status == 'done' else 1]
+        if status != 'done':
+            done_text = WISH_LABELS.get(media_type, done_text)
+
+        title = SubtitleLabel(self.data.get('title') or '', self)
+        title.setWordWrap(True)
+        self.viewLayout.addWidget(title)
+        subtitle_text = f"{MEDIA_LABELS.get(media_type, '')} · {done_text}"
+        if source_text:
+            subtitle_text += f" · {source_text}"
+        subtitle = CaptionLabel(subtitle_text, self)
+        subtitle.setTextColor('#5f6b7a', '#8d95a5')
+        self.viewLayout.addWidget(subtitle)
+
+        body = QHBoxLayout()
+        body.setSpacing(20)
+        left_widget = QWidget(self)
+        left_widget.setFixedWidth(200)
+        left = QVBoxLayout(left_widget)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(10)
+        left.addWidget(StrongBodyLabel('条目信息', left_widget))
+        cover = _CoverLabel(180, 260, left_widget)
+        cover.setStyleSheet('background:#0f131b; border-radius:6px;')
+        cover.setSourcePixmap(
+            _cover_pixmap(self.data.get('cover_path') or '', 180, 260, fill=True))
+        left.addWidget(cover, 0, Qt.AlignLeft)
+        left.addStretch(1)
+        info = QVBoxLayout()
+        info.setSpacing(8)
+        for text in self._info_lines(media_type):
+            label = BodyLabel(text, left_widget)
+            label.setWordWrap(True)
+            info.addWidget(label)
+        left.addLayout(info)
+        body.addWidget(left_widget, 1)
+
+        right_widget = QWidget(self)
+        right = QVBoxLayout(right_widget)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(8)
+        right.addWidget(StrongBodyLabel('简介', right_widget))
+        self.intro_scroll = QScrollArea(right_widget)
+        self.intro_scroll.setWidgetResizable(True)
+        self.intro_scroll.setFrameShape(QFrame.NoFrame)
+        self.intro_scroll.setStyleSheet('QScrollArea{background:transparent;border:none;}')
+        holder = QWidget()
+        holder.setStyleSheet('background:transparent;')
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        self.intro_label = _SelectableLabel(holder)
+        self.intro_label.setWordWrap(True)
+        self.intro_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.intro_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.intro_label.setText(
+            (self.data.get('intro') or '').strip() or '豆瓣上暂无简介。')
+        holder_layout.addWidget(self.intro_label)
+        holder_layout.addStretch(1)
+        self.intro_scroll.setWidget(holder)
+        self.intro_scroll.setMinimumHeight(120)
+        right.addWidget(self.intro_scroll, 1)
+
+        note = (self.data.get('comment') or self.data.get('note') or '').strip()
+        if note:
+            right.addWidget(StrongBodyLabel('备注', right_widget))
+            note_label = _SelectableLabel(right_widget)
+            note_label.setWordWrap(True)
+            note_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            note_label.setText(note)
+            right.addWidget(note_label)
+        self.resource_title = StrongBodyLabel('资源', right_widget)
+        right.addWidget(self.resource_title)
+        self.resource_box = QWidget(right_widget)
+        self.resource_box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.resource_grid = QGridLayout(self.resource_box)
+        self.resource_grid.setContentsMargins(0, 0, 0, 0)
+        self.resource_grid.setHorizontalSpacing(8)
+        self.resource_grid.setVerticalSpacing(12)
+        right.addWidget(self.resource_box)
+        _populate_resources(self.resource_grid, self.resource_title, self.resource_box,
+                            self.db, media_type, self.data.get('title') or '')
+        body.addWidget(right_widget, 2)
+        self.viewLayout.addLayout(body)
+        self._fit_height()
+
+    def _info_lines(self, media_type: str) -> list[str]:
+        lines: list[str] = []
+        rating = int(self.data.get('rating') or 0)
+        if rating:
+            lines.append(f"豆瓣评分：{'★' * rating}{'☆' * max(0, 5 - rating)}")
+        year = self.data.get('year') or ''
+        if year:
+            lines.append(f'年份：{year}')
+        release = self.data.get('release_date') or ''
+        if release:
+            lines.append(f"{'上映' if media_type == 'movie' else '出版'}：{release}")
+        if media_type == 'book':
+            pages = int(self.data.get('pages') or 0)
+            if pages:
+                lines.append(f'页数：{pages}')
+            words = int(self.data.get('word_count') or 0)
+            if words:
+                lines.append(f'字数：{words}')
+        else:
+            minutes = int(self.data.get('duration_minutes') or 0)
+            if minutes:
+                hours, rest = divmod(minutes, 60)
+                lines.append(
+                    f'时长：{hours} 小时 {rest} 分' if hours else f'时长：{rest} 分钟')
+        if not lines:
+            lines.append('豆瓣上还没有更多信息')
+        return lines
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._fit_height()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        available = self.height()
+        if available <= 0:
+            return
+        target = max(460, min(620, available - 24))
+        if self.widget.minimumHeight() != target:
+            self.widget.setFixedHeight(target)
+
+    def validate(self) -> bool:
+        if self.url:
+            QDesktopServices.openUrl(QUrl(self.url))
+        return True
+
+
+def open_item_detail(db: Database, item, parent=None, source_text: str = '') -> None:
+    """豆列 / 计划条目：没有本地记录时展示条目详情，而不是直接跳豆瓣。"""
+    ItemDetailDialog(db, item, parent, source_text).exec()
 
 
 class SyncDialog(MessageBoxBase):

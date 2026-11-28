@@ -5,15 +5,11 @@ from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, Signal
-from PySide6.QtGui import (
-    QColor, QFontMetrics, QImage, QPainter, QPen, QPixmap, QTextLayout,
-)
-from PySide6.QtGui import QTextOption
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QVBoxLayout
 
 from qfluentwidgets import (
-    BodyLabel, CaptionLabel, CardWidget, FluentIcon, StrongBodyLabel,
-    TransparentToolButton, ToolTipFilter, isDarkTheme,
+    CardWidget, FluentIcon, TransparentToolButton, ToolTipFilter, isDarkTheme, qconfig,
 )
 
 from app.config import CACHE_DIR, MEDIA_LABELS, ROOT
@@ -21,58 +17,77 @@ from app.cover_sync import is_custom_cover
 from app.media_meta import book_stats_text_full, movie_stats_text
 
 
-def _two_line_text(text: str, font, width: int) -> str:
+def _elide_to_lines(label, text: str, width: int, max_lines: int, wrap=None) -> str:
+    """把文本裁到 label 在 width 下最多 max_lines 行，超出部分用省略号收尾。
+
+    行数交给 QLabel 自己算：短评里的 emoji 会走彩色字体回退，QFontMetrics /
+    QTextLayout 量出的宽度比实际渲染窄，按预算裁好的行在 QLabel 里会多折一行，
+    固定高度下首行与末行各被切掉一半。wrap 用于搜索高亮，保证量的是富文本。
+    """
+    # 先套用样式表里的字体，否则按默认字体量出来的行数到显示时会变。
+    label.ensurePolished()
+    limit = QFontMetrics(label.font()).lineSpacing() * max_lines + 2
+    label.setFixedHeight(limit)
+
+    def show(chunk: str) -> bool:
+        label.setText(wrap(chunk) if wrap else chunk)
+        return label.heightForWidth(width) <= limit
+
     text = re.sub(r'\s+', ' ', text or '').strip()
     if not text:
+        show('')
         return ''
-    metrics = QFontMetrics(font)
-    if metrics.horizontalAdvance(text) <= width:
+    if show(text):
         return text
-    layout = QTextLayout(text, font)
-    option = QTextOption()
-    option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-    layout.setTextOption(option)
-    layout.beginLayout()
-    first = layout.createLine()
-    if not first.isValid():
-        return text
-    first.setLineWidth(width)
-    second = layout.createLine()
-    if not second.isValid():
-        return text
-    second.setLineWidth(width)
-    layout.endLayout()
-    first_text = text[first.textStart():first.textStart() + first.textLength()].rstrip()
-    rest = text[second.textStart():]
-    second_text = metrics.elidedText(rest, Qt.ElideRight, width)
-    return first_text + '\n' + second_text
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if show(text[:mid].rstrip() + '…'):
+            low = mid
+        else:
+            high = mid - 1
+    elided = text[:low].rstrip() + '…'
+    show(elided)
+    return elided
 
 
-def _elided_lines(text: str, font, width: int, max_lines: int) -> str:
-    text = re.sub(r'\s+', ' ', text or '').strip()
-    if not text:
-        return ''
-    metrics = QFontMetrics(font)
-    layout = QTextLayout(text, font)
-    option = QTextOption()
-    option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
-    layout.setTextOption(option)
-    layout.beginLayout()
-    ranges = []
-    for _ in range(max_lines):
-        line = layout.createLine()
-        if not line.isValid():
-            break
-        line.setLineWidth(width)
-        ranges.append((line.textStart(), line.textLength()))
-    layout.endLayout()
-    if not ranges:
-        return text
-    lines = [text[start:start + length].rstrip() for start, length in ranges]
-    last_start, last_length = ranges[-1]
-    if last_start + last_length < len(text):
-        lines[-1] = metrics.elidedText(text[last_start:], Qt.ElideRight, width)
-    return '\n'.join(lines)
+_TONES = {
+    'title': ('#1b1b1b', '#ffffff'),
+    'muted': ('#5f6b7a', '#8d95a5'),
+    'gold': ('#b07c20', '#e5b45f'),
+}
+
+
+def _apply_tone(label: QLabel) -> None:
+    """按深浅主题给卡片内的文字上色；用调色板而不是样式表，重建卡片时省下几毫秒。"""
+    colors = label.property('cardColors')
+    if colors:
+        light, dark = colors
+    else:
+        tone = label.property('cardTone')
+        if not tone:
+            return
+        light, dark = _TONES[tone]
+    color = QColor(dark if isDarkTheme() else light)
+    palette = label.palette()
+    palette.setColor(QPalette.WindowText, color)
+    palette.setColor(QPalette.Text, color)
+    label.setPalette(palette)
+
+
+def _text_label(parent, text: str, size: int = 12, weight=QFont.Weight.Normal,
+                tone: str = 'muted', colors=None) -> QLabel:
+    label = QLabel(text, parent)
+    font = QFont(label.font())
+    font.setPixelSize(size)
+    font.setWeight(weight)
+    label.setFont(font)
+    if colors:
+        label.setProperty('cardColors', tuple(colors))
+    else:
+        label.setProperty('cardTone', tone)
+    _apply_tone(label)
+    return label
 
 
 def _highlight_html(text: str, keyword: str) -> str:
@@ -103,15 +118,33 @@ def _cover_pixmap(path: str, width: int, height: int, fill: bool = False) -> QPi
         stamp = full.stat().st_mtime_ns
     except OSError:
         stamp = 0
+    # 同一张封面会被几十张卡片反复取用，读文件加解码要几毫秒，这里按尺寸缓存。
+    key = f'{full}|{width}x{height}|{int(bool(fill))}'
+    hit = _sync_pixmap_cache.get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
     thumb = _thumb_path(full, width, height, fill)
     try:
         if thumb.exists() and thumb.stat().st_mtime_ns >= stamp:
             cached = QPixmap(str(thumb))
             if not cached.isNull():
+                _remember_pixmap(key, stamp, cached)
                 return cached
     except OSError:
         pass
-    return _scaled_cover(str(full), width, height, fill, stamp)
+    pixmap = _scaled_cover(str(full), width, height, fill, stamp)
+    _remember_pixmap(key, stamp, pixmap)
+    return pixmap
+
+
+_sync_pixmap_cache: dict[str, tuple[int, QPixmap]] = {}
+_SYNC_CACHE_LIMIT = 120
+
+
+def _remember_pixmap(key: str, stamp: int, pixmap: QPixmap) -> None:
+    _sync_pixmap_cache[key] = (stamp, pixmap)
+    while len(_sync_pixmap_cache) > _SYNC_CACHE_LIMIT:
+        _sync_pixmap_cache.pop(next(iter(_sync_pixmap_cache)))
 
 
 def _empty_pixmap(width: int, height: int) -> QPixmap:
@@ -289,24 +322,17 @@ class RecordCard(CardWidget):
         cover.setPixmap(_empty_pixmap(194, 272))
         cover.setStyleSheet('background:#0f131b; border-radius:7px;')
         self.cover_label = cover
-        self.cover_sync_tag = QLabel(' 同步 ', cover)
-        self.cover_sync_tag.setStyleSheet(
-            'color:#241804; background:rgba(229,180,95,0.92); border-radius:9px;'
-            ' font-size:10px; font-weight:600; padding:0 2px;')
-        self.cover_sync_tag.setToolTip('自定义封面，豆瓣无法重新获取，会随云同步保存')
-        self.cover_sync_tag.adjustSize()
-        self.cover_sync_tag.move(194 - self.cover_sync_tag.width() - 8, 8)
-        self.cover_sync_tag.setVisible(is_custom_cover(
-            record['media_type'], record['subject_id'], record['cover_path'] or ''))
+        # 同步角标只有自定义封面才有，先不建，省下每个卡片一次标签构造。
+        self.cover_sync_tag = None
         layout.addWidget(cover)
         self._request_cover(record['cover_path'] or '')
+        self._sync_tag(is_custom_cover(
+            record['media_type'], record['subject_id'], record['cover_path'] or ''))
 
-        title = StrongBodyLabel('', self)
+        title = _text_label(self, '', 14, QFont.Weight.DemiBold, 'title')
         title.setWordWrap(True)
-        metrics = QFontMetrics(title.font())
-        title.setFixedHeight(metrics.lineSpacing() * 2 + 2)
         self.title_label = title
-        self.title_text = _elided_lines(record['title'] or '', title.font(), 194, 2)
+        self.title_text = _elide_to_lines(title, record['title'] or '', 194, 2)
         title.setToolTip(record['title'] or '')
         layout.addWidget(title)
 
@@ -314,8 +340,7 @@ class RecordCard(CardWidget):
             stats = book_stats_text_full(record['subject_id'], int(record['word_count'] or 0))
         else:
             stats = movie_stats_text(record['intro'] or '', record['subject_id'])
-        stats_label = CaptionLabel(stats, self)
-        stats_label.setTextColor('#5f6b7a', '#8d95a5')
+        stats_label = _text_label(self, stats)
         if record['book_file']:
             stats_label.setToolTip(record['book_file'])
         self.stats_label = stats_label
@@ -324,20 +349,16 @@ class RecordCard(CardWidget):
         meta = QHBoxLayout()
         meta.setSpacing(5)
         stars = int(record['rating'] or 0)
-        star_label = BodyLabel('★' * stars + '☆' * (5 - stars) if stars else '未评分', self)
-        star_font = star_label.font()
-        star_font.setPixelSize(12)
-        star_label.setFont(star_font)
-        star_label.setTextColor('#b07c20', '#e5b45f')
+        star_label = _text_label(self, '★' * stars + '☆' * (5 - stars) if stars else '未评分',
+                                 tone='gold')
         self.star_label = star_label
         meta.addWidget(star_label)
         meta.addStretch(1)
         date_text = record['effective_date'] or record['marked_date'] or '未设置'
-        date_label = CaptionLabel(date_text, self)
+        date_label = _text_label(self, date_text)
         self.date_label = date_label
         meta.addWidget(date_label)
-        local = CaptionLabel('本地', self)
-        local.setTextColor('#b07c20', '#e5b45f')
+        local = _text_label(self, '本地', tone='gold')
         local.setToolTip('本地修改过的评分/短评/日期，同步时不会覆盖')
         local.setVisible(bool(
             record['date_overridden'] or record['rating_overridden']
@@ -347,14 +368,9 @@ class RecordCard(CardWidget):
         meta.addWidget(local)
         layout.addLayout(meta)
 
-        comment_label = CaptionLabel('', self)
+        comment_label = _text_label(self, '')
         comment_label.setWordWrap(True)
-        comment_metrics = QFontMetrics(comment_label.font())
-        comment_label.setFixedHeight(comment_metrics.lineSpacing() * 3 + 2)
-        self.comment_text = _elided_lines(
-            self.comment, comment_label.font(), 194, 3
-        )
-        comment_label.setTextColor('#5f6b7a', '#8d95a5')
+        self.comment_text = _elide_to_lines(comment_label, self.comment, 194, 3)
         comment_label.setToolTip(self.comment)
         # 没有短评就不占位：无短评卡片整体更矮，中间不留空白。
         comment_label.setVisible(bool(self.comment))
@@ -369,8 +385,7 @@ class RecordCard(CardWidget):
             type_text = '想看' if record['media_type'] == 'movie' else '想读'
         else:
             type_text = MEDIA_LABELS[record['media_type']]
-        type_label = CaptionLabel(type_text, self)
-        type_label.setTextColor('#b07c20', '#e5b45f')
+        type_label = _text_label(self, type_text, tone='gold')
         self.type_label = type_label
         actions.addWidget(type_label)
         actions.addStretch(1)
@@ -403,9 +418,33 @@ class RecordCard(CardWidget):
         delete_button.clicked.connect(lambda: self.delete_requested.emit(int(record['id'])))
         actions.addWidget(delete_button)
         layout.addLayout(actions)
+        self._tone_labels = [
+            title, stats_label, star_label, date_label, local, comment_label, type_label,
+        ]
+        qconfig.themeChanged.connect(self._apply_theme)
         self.set_highlight(self.highlight)
         # 固定高度，避免卡片刚加入布局时先以默认高度显示、随后再被撑开。
         self.setFixedHeight(self.sizeHint().height())
+
+    def _apply_theme(self) -> None:
+        for label in self._tone_labels:
+            _apply_tone(label)
+
+    def _sync_tag(self, visible: bool) -> None:
+        """自定义封面角标：需要时才建，避免每张卡都多一个标签。"""
+        if visible and self.cover_sync_tag is None:
+            tag = QLabel(' 同步 ', self.cover_label)
+            tag.setStyleSheet(
+                'color:#241804; background:rgba(229,180,95,0.92); border-radius:9px;'
+                ' font-size:10px; font-weight:600; padding:0 2px;')
+            tag.setToolTip('自定义封面，豆瓣无法重新获取，会随云同步保存')
+            tag.adjustSize()
+            tag.move(194 - tag.width() - 8, 8)
+            tag.show()
+            self.cover_sync_tag = tag
+            return
+        if self.cover_sync_tag is not None:
+            self.cover_sync_tag.setVisible(visible)
 
     def _request_cover(self, path: str) -> None:
         request_cover(
@@ -428,9 +467,8 @@ class RecordCard(CardWidget):
         self.box.setSpacing(7)
         if force_cover or (record['cover_path'] or '') != old_cover:
             self._request_cover(record['cover_path'] or '')
-        self.title_text = _elided_lines(
-            record['title'] or '', self.title_label.font(), 194, 2
-        )
+        self.title_text = _elide_to_lines(
+            self.title_label, record['title'] or '', 194, 2)
         self.title_label.setToolTip(record['title'] or '')
         if record['media_type'] == 'book':
             stats = book_stats_text_full(
@@ -451,7 +489,7 @@ class RecordCard(CardWidget):
             record['date_overridden'] or record['rating_overridden']
             or record['comment_overridden']
         ))
-        self.cover_sync_tag.setVisible(is_custom_cover(
+        self._sync_tag(is_custom_cover(
             record['media_type'], record['subject_id'], record['cover_path'] or ''))
         if record['status'] == 'wish':
             type_text = '想看' if record['media_type'] == 'movie' else '想读'
@@ -459,9 +497,8 @@ class RecordCard(CardWidget):
             type_text = MEDIA_LABELS[record['media_type']]
         self.type_label.setText(type_text)
         if self.comment:
-            self.comment_text = _elided_lines(
-                self.comment, self.comment_label.font(), 194, 3
-            )
+            self.comment_text = _elide_to_lines(
+                self.comment_label, self.comment, 194, 3)
             self.comment_label.setToolTip(self.comment)
         else:
             self.comment_text = ''
@@ -479,17 +516,21 @@ class RecordCard(CardWidget):
 
     def set_highlight(self, keyword: str) -> None:
         self.highlight = (keyword or '').strip()
-        self._set_label_text(self.title_label, self.title_text)
+        self._set_label_text(self.title_label, self.title_text, 2)
         if self.comment_label is not None:
-            self._set_label_text(self.comment_label, self.comment_text)
+            self._set_label_text(self.comment_label, self.comment_text, 3)
 
-    def _set_label_text(self, label, text: str) -> None:
-        if self.highlight:
-            label.setTextFormat(Qt.RichText)
-            label.setText(_highlight_html(text, self.highlight))
-        else:
+    def _set_label_text(self, label, text: str, max_lines: int) -> None:
+        if not self.highlight:
             label.setTextFormat(Qt.PlainText)
             label.setText(text)
+            return
+        label.setTextFormat(Qt.RichText)
+        # 高亮后的富文本行宽与纯文本略有差异，仍按 label 自己的换行结果裁剪。
+        elided = _elide_to_lines(
+            label, text, 194, max_lines,
+            wrap=lambda chunk: _highlight_html(chunk, self.highlight))
+        label.setText(_highlight_html(elided, self.highlight))
 
     def _normalBackgroundColor(self):
         return QColor(255, 255, 255, 13 if isDarkTheme() else 235)

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, Signal, QUrl
+from PySide6.QtCore import QSize, Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QProgressBar, QStackedWidget,
@@ -16,9 +16,11 @@ from qfluentwidgets import (
 from app.config import MEDIA_LABELS, MEDIA_NOUNS, READ_LABELS, ROOT
 from app.db import Database
 from app.media_meta import book_stats_text_full, movie_stats_text
-from app.ui.dialogs import MediaMetaDialog, SyncDialog
+from app.ui.dialogs import (
+    MediaMetaDialog, SyncDialog, open_item_detail, open_record_detail,
+)
 from app.ui.read_stamp import ReadStamp
-from app.ui.record_card import _cover_pixmap, _two_line_text
+from app.ui.record_card import _apply_tone, _cover_pixmap, _elide_to_lines, _text_label
 from app.ui.scroll_area import SmoothScrollArea
 from app.ui.segmented import SegmentedSwitch
 from app.ui.styles import progress_style, surface_style, primary_button
@@ -87,27 +89,24 @@ class DoulistListCard(QFrame):
         collage.setPixmap(_doulist_cover_pixmap(items, 194, 272))
         collage.setStyleSheet('background:#0f131b; border-radius:7px;')
         layout.addWidget(collage)
-        title = StrongBodyLabel('', self)
+        title = _text_label(self, '', size=14, weight=QFont.Weight.DemiBold, tone='title')
         title.setWordWrap(True)
-        metrics = QFontMetrics(title.font())
-        title.setFixedHeight(metrics.lineSpacing() * 2 + 2)
-        title.setText(_two_line_text(doulist['title'] or '', title.font(), 194))
+        title.setText(_elide_to_lines(title, doulist['title'] or '', 194, 2))
         title.setToolTip(doulist['title'] or '')
         layout.addWidget(title)
         footer = QHBoxLayout()
-        relation = CaptionLabel(RELATION_LABELS.get(doulist['relation'], '豆列'), self)
-        relation.setTextColor(*RELATION_COLORS.get(doulist['relation'],
-                                             ('#5f6b7a', '#8d95a5')))
+        relation = _text_label(
+            self, RELATION_LABELS.get(doulist['relation'], '豆列'),
+            colors=RELATION_COLORS.get(doulist['relation'], ('#5f6b7a', '#8d95a5')))
         footer.addWidget(relation)
         if doulist['media_type'] not in ('movie', 'book'):
-            mixed = CaptionLabel('混合', self)
-            mixed.setTextColor('#5f6b7a', '#8d95a5')
+            mixed = _text_label(self, '混合')
             footer.addWidget(mixed)
         footer.addStretch(1)
         total = int(doulist['local_count'] or 0)
         read = min(total, int(doulist['read_count'] or 0))
-        stats = CaptionLabel(_count_text(doulist['media_type'], read, total), self)
-        stats.setTextColor('#4b5563', '#b9b5aa')
+        stats = _text_label(self, _count_text(doulist['media_type'], read, total),
+                            colors=('#4b5563', '#b9b5aa'))
         layout.addWidget(stats)
         progress = QProgressBar(self)
         progress.setFixedHeight(7)
@@ -119,8 +118,9 @@ class DoulistListCard(QFrame):
         self.progress_bar = progress
         layout.addWidget(progress)
         if total and read == total:
-            complete = CaptionLabel('已看完' if doulist['media_type'] == 'movie' else '已读完', self)
-            complete.setTextColor('#4f7d3a', '#7fae68')
+            complete = _text_label(
+                self, '已看完' if doulist['media_type'] == 'movie' else '已读完',
+                colors=('#4f7d3a', '#7fae68'))
             footer.addWidget(complete)
         up_button = TransparentToolButton(FluentIcon.UP, self)
         up_button.setIconSize(QSize(12, 12))
@@ -143,10 +143,16 @@ class DoulistListCard(QFrame):
         )
         footer.addWidget(delete_button)
         layout.addLayout(footer)
+        self._tone_labels = [
+            label for label in self.findChildren(QLabel)
+            if label.property('cardTone') or label.property('cardColors')
+        ]
 
     def _apply_theme(self, *_) -> None:
         self.setStyleSheet(surface_style('doulistListCard', 12))
         self.progress_bar.setStyleSheet(progress_style())
+        for label in self._tone_labels:
+            _apply_tone(label)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -157,6 +163,7 @@ class DoulistListCard(QFrame):
 class DoulistDetailRow(QFrame):
     move_requested = Signal(int, int)
     edit_requested = Signal(int)
+    open_requested = Signal(object)
 
     def __init__(self, item, word_counts=None, movie_intros=None, parent=None):
         super().__init__(parent)
@@ -166,7 +173,7 @@ class DoulistDetailRow(QFrame):
         self.setObjectName('doulistDetailRow')
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip('点击在豆瓣打开')
+        self.setToolTip('点击查看条目详情')
         self.setStyleSheet(surface_style('doulistDetailRow', 10))
         qconfig.themeChanged.connect(self._apply_theme)
         layout = QHBoxLayout(self)
@@ -244,18 +251,15 @@ class DoulistDetailRow(QFrame):
     def _apply_theme(self, *_) -> None:
         self.setStyleSheet(surface_style('doulistDetailRow', 10))
 
-    def _open(self) -> None:
-        if self.item['url']:
-            QDesktopServices.openUrl(QUrl(self.item['url']))
-
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._open()
+            self.open_requested.emit(self.item)
         super().mouseReleaseEvent(event)
 
 
 class DoulistPage(QWidget):
     synced = Signal(dict)
+    record_changed = Signal(str)
 
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
@@ -268,6 +272,11 @@ class DoulistPage(QWidget):
         self._flow = None
         self._detail_rows = {}
         self._dirty = False
+        # 卡片分批创建：一次性建几十张卡片会让切换页面卡住几百毫秒。
+        self._card_queue: list = []
+        self._card_items: dict[int, list] = {}
+        self._card_parent = None
+        self._card_generation = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(32, 26, 32, 26)
@@ -391,6 +400,9 @@ class DoulistPage(QWidget):
         self._clear_layout(self.outer_layout)
         self._cards = []
         self._flow = None
+        # 停掉上一轮还在排队建卡的批次。
+        self._card_generation += 1
+        self._card_queue = []
         lists = [row for row in self._lists
                  if row['media_type'] == self._selected_type
                  or row['media_type'] not in ('movie', 'book')]
@@ -415,14 +427,13 @@ class DoulistPage(QWidget):
             flow.setHorizontalSpacing(14)
             flow.setVerticalSpacing(14)
             self._flow = flow
-            for doulist in lists:
-                items = self.db.doulist_items(int(doulist['id']))
-                card = DoulistListCard(doulist, items, grid)
-                card.open_requested.connect(self.show_detail)
-                card.move_requested.connect(self.move_doulist)
-                card.delete_requested.connect(self.delete_doulist)
-                flow.addWidget(card)
-                self._cards.append(card)
+            self._card_parent = grid
+            # 一次性建完几十张卡会卡住 300ms 以上，这里排队分批建，界面先出来再补卡片。
+            self._card_items = {int(row['id']): self.db.doulist_items(int(row['id']))
+                                for row in lists}
+            self._card_queue = list(lists)
+            # 首批少建几张，先把页面显示出来，剩下的交给定时器补。
+            self._pump_cards(budget=3)
             self.outer_layout.addWidget(grid)
         else:
             empty = BodyLabel(f'还没有{title}，同步豆瓣时勾选「同步豆列」并填写 Cookie。', self.outer_container)
@@ -431,6 +442,29 @@ class DoulistPage(QWidget):
             self.outer_layout.addWidget(empty)
         self.outer_layout.addStretch(1)
         self.outer_scroll.verticalScrollBar().setValue(0)
+
+    _CARD_BATCH = 6
+
+    def _pump_cards(self, budget: int | None = None) -> None:
+        """分批把排队中的豆列卡片建出来，每批建完就让出事件循环。"""
+        if not self.isVisible():
+            # 页面已经切走，剩下的卡片留到下次显示时再补，别在后台抢时间。
+            return
+        generation = self._card_generation
+        budget = self._CARD_BATCH if budget is None else budget
+        while budget > 0 and self._card_queue:
+            doulist = self._card_queue.pop(0)
+            items = self._card_items.get(int(doulist['id']), [])
+            card = DoulistListCard(doulist, items, self._card_parent)
+            card.open_requested.connect(self.show_detail)
+            card.move_requested.connect(self.move_doulist)
+            card.delete_requested.connect(self.delete_doulist)
+            self._flow.addWidget(card)
+            self._cards.append(card)
+            budget -= 1
+        if self._card_queue:
+            QTimer.singleShot(
+                0, lambda: self._card_generation == generation and self._pump_cards())
 
     def refresh(self) -> None:
         self._dirty = False
@@ -449,6 +483,9 @@ class DoulistPage(QWidget):
         super().showEvent(event)
         if self._dirty:
             self.refresh()
+        if self._card_queue:
+            # 上次切走时没建完，这里接着补。
+            self._pump_cards()
 
     def show_detail(self, doulist_id: int, keep_scroll: bool = False) -> None:
         doulist = next((row for row in self._lists if int(row['id']) == int(doulist_id)), None)
@@ -478,15 +515,35 @@ class DoulistPage(QWidget):
         else:
             word_counts = self.db.word_count_map('book')
             movie_intros = self.db.intro_map('movie')
+            existing = {(r['media_type'], str(r['subject_id']))
+                        for r in self.db.list_all_records()}
             for item in items:
                 row = DoulistDetailRow(item, word_counts, movie_intros, self.detail_container)
                 row.move_requested.connect(self.move_doulist_item)
                 row.edit_requested.connect(self.edit_item_meta)
+                row.open_requested.connect(self.open_item)
+                if (item['media_type'], str(item['subject_id'])) in existing:
+                    row.setToolTip('点击查看记录详情')
+                else:
+                    row.setToolTip('点击查看条目详情')
                 self.detail_layout.addWidget(row)
                 self._detail_rows[int(item['id'])] = row
         self.detail_layout.addStretch(1)
         self.detail_scroll.verticalScrollBar().setValue(scroll_value)
         self.stack.setCurrentWidget(self.detail_page)
+
+    def open_item(self, item) -> None:
+        record = self.db.find_record_any(item['media_type'], str(item['subject_id']))
+        if record is None:
+            # 豆列里有、记录里还没有的条目：先看条目详情，别直接把人扔进浏览器。
+            source = (f'来自豆列「{self._current_doulist["title"]}」'
+                      if self._current_doulist else '豆列')
+            open_item_detail(self.db, item, self.window(), source)
+            return
+        if open_record_detail(self.db, record, self.window()):
+            if self._current_doulist:
+                self.show_detail(int(self._current_doulist['id']), keep_scroll=True)
+            self.record_changed.emit(record['media_type'])
 
     def edit_item_meta(self, item_id: int) -> None:
         row = self._detail_rows.get(int(item_id))

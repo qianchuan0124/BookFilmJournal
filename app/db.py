@@ -859,6 +859,16 @@ class Database:
                 WHERE media_type=? AND subject_id=? AND status=? AND deleted_at=''
             ''', (media_type, str(subject_id), status)).fetchone()
 
+    def find_record_any(self, media_type: str, subject_id: str) -> Optional[sqlite3.Row]:
+        """按条目找记录，不限定状态；已看/已读优先于想看/想读。"""
+        with self._connect() as conn:
+            return conn.execute('''
+                SELECT * FROM records
+                WHERE media_type=? AND subject_id=? AND deleted_at=''
+                ORDER BY CASE status WHEN 'done' THEN 0 ELSE 1 END, id
+                LIMIT 1
+            ''', (media_type, str(subject_id))).fetchone()
+
     def find_deleted_record(self, media_type: str, subject_id: str,
                             status: str = 'done') -> Optional[sqlite3.Row]:
         with self._connect() as conn:

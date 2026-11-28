@@ -37,6 +37,7 @@ APP_VERSION_TEXT = f'v{APP_VERSION}'
 MEDIA_LABELS = {'movie': '观影', 'book': '读书'}
 MEDIA_NOUNS = {'movie': '部', 'book': '本'}
 READ_LABELS = {'movie': ('已看', '未看'), 'book': ('已读', '未读')}
+WISH_LABELS = {'movie': '想看', 'book': '想读'}
 
 
 def ensure_dirs() -> None:

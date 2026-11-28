@@ -37,9 +37,10 @@ class RecordsPage(QWidget):
     record_changed = Signal(str)
 
     # 首屏同步创建少量卡片，其余在事件循环空闲时分批补齐。
-    _INITIAL_CARDS = 12
-    _WARMUP_CARDS = 8
-    _BATCH_CARDS = 8
+    _INITIAL_CARDS = 10
+    _WARMUP_CARDS = 6
+    # 单张卡片要十几毫秒，一批太多会明显顿一下。
+    _BATCH_CARDS = 4
 
     def __init__(self, db: Database, media_type: str, parent=None):
         super().__init__(parent)
@@ -418,7 +419,10 @@ class RecordsPage(QWidget):
         self._schedule_warmup()
 
     def mark_dirty(self) -> None:
-        # 即使在后台也立即重建首屏，避免切换到该页时才做耗时构建导致先显示旧内容。
+        # 不可见时只记脏，等切到这一页再重建：后台重建要几百毫秒，会把别的页面卡住。
+        if not self.isVisible():
+            self._dirty = True
+            return
         self._dirty = False
         self.refresh()
 
@@ -615,9 +619,7 @@ class RecordsPage(QWidget):
         row = self.db.get_record(record_id)
         if row is None:
             return
-        if row['status'] != 'done':
-            self.edit_record(record_id)
-            return
+        # 想看/想读的记录也先进详情页，需要改状态再从详情页点「编辑记录」。
         dialog = RecordDetailDialog(self.db, row, self.window())
         dialog.changed.connect(self._on_detail_changed)
         dialog.exec()

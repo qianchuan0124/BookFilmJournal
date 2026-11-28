@@ -2,8 +2,8 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontMetrics, QPainter, QPixmap
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel, QProgressBar,
     QScrollArea, QStackedWidget, QVBoxLayout, QWidget,
@@ -20,11 +20,12 @@ from app.config import MEDIA_NOUNS, PLANS_DIR, READ_LABELS
 from app.db import Database
 from app.media_meta import book_stats_text_full, movie_stats_text
 from app.profile import effective_name
+from app.ui.dialogs import open_item_detail, open_record_detail
 from app.ui.read_stamp import ReadStamp
 from app.ui.segmented import SegmentedSwitch
 from app.ui.scroll_area import SmoothScrollArea
 from app.ui.styles import progress_style, search_edit_style, surface_style, primary_button
-from app.ui.record_card import _cover_pixmap, _highlight_html, _two_line_text
+from app.ui.record_card import _cover_pixmap, _elide_to_lines, _highlight_html
 
 SOURCE_LABELS = {'wish': '想看/想读', 'doulist': '豆列', 'manual': '手动'}
 
@@ -108,9 +109,7 @@ class PlanFolderCard(QFrame):
 
         title = StrongBodyLabel('', self)
         title.setWordWrap(True)
-        metrics = QFontMetrics(title.font())
-        title.setFixedHeight(metrics.lineSpacing() * 2 + 2)
-        title.setText(_two_line_text(folder['title'] or '', title.font(), 194))
+        title.setText(_elide_to_lines(title, folder['title'] or '', 194, 2))
         title.setToolTip(folder['title'] or '')
         layout.addWidget(title)
 
@@ -222,7 +221,7 @@ class PlanFolderDialog(MessageBoxBase):
 class PlanRow(QFrame):
     move_requested = Signal(int, int)
     delete_requested = Signal(int)
-    open_requested = Signal(str)
+    open_requested = Signal(object)
 
     def __init__(self, position: int, item, stats_text: str = '', parent=None):
         super().__init__(parent)
@@ -230,7 +229,7 @@ class PlanRow(QFrame):
         self.setObjectName('planRow')
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setCursor(Qt.PointingHandCursor)
-        self.setToolTip('点击在豆瓣打开')
+        self.setToolTip('点击查看条目详情')
         self.setStyleSheet(surface_style('planRow', 10))
         qconfig.themeChanged.connect(self._apply_theme)
         layout = QHBoxLayout(self)
@@ -304,13 +303,9 @@ class PlanRow(QFrame):
     def _apply_theme(self, *_) -> None:
         self.setStyleSheet(surface_style('planRow', 10))
 
-    def _open(self) -> None:
-        if self.item['url']:
-            QDesktopServices.openUrl(QUrl(self.item['url']))
-
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.LeftButton:
-            self._open()
+            self.open_requested.emit(self.item)
         super().mouseReleaseEvent(event)
 
 
@@ -751,6 +746,8 @@ class AddDoulistDialog(MessageBoxBase):
 
 
 class PlanPage(QWidget):
+    record_changed = Signal(str)
+
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
@@ -760,6 +757,11 @@ class PlanPage(QWidget):
         self._current_folder_id = 0
         self.rows = []
         self._dirty = False
+        # 计划卡片分批创建，避免一次性建完卡住页面切换。
+        self._folder_queue: list = []
+        self._folder_flow = None
+        self._folder_parent = None
+        self._folder_generation = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(32, 26, 32, 26)
@@ -901,6 +903,9 @@ class PlanPage(QWidget):
 
     def _build_outer_grid(self) -> None:
         self._clear_layout(self.outer_layout)
+        # 停掉上一轮还在排队建卡的批次。
+        self._folder_generation += 1
+        self._folder_queue = []
         if self._folders:
             total_items = sum(int(folder['item_count']) for folder in self._folders)
             total_read = sum(min(int(folder['item_count']), int(folder['read_count'] or 0))
@@ -919,12 +924,11 @@ class PlanPage(QWidget):
             flow.setContentsMargins(0, 0, 0, 0)
             flow.setHorizontalSpacing(14)
             flow.setVerticalSpacing(14)
-            for folder in self._folders:
-                card = PlanFolderCard(folder, grid)
-                card.open_requested.connect(self.show_detail)
-                card.move_requested.connect(self.move_folder)
-                card.delete_requested.connect(self.delete_folder)
-                flow.addWidget(card)
+            self._folder_flow = flow
+            self._folder_parent = grid
+            # 计划卡片带封面合成，全部同步建完会卡住页面切换，这里分批建。
+            self._folder_queue = list(self._folders)
+            self._pump_folders()
             self.outer_layout.addWidget(grid)
         else:
             empty = BodyLabel('还没有计划，点击右上角「新建计划」创建一个文件夹。',
@@ -934,6 +938,26 @@ class PlanPage(QWidget):
             self.outer_layout.addWidget(empty)
         self.outer_layout.addStretch(1)
         self.outer_scroll.verticalScrollBar().setValue(0)
+
+    _FOLDER_BATCH = 6
+
+    def _pump_folders(self) -> None:
+        """分批创建计划卡片，每批建完让出事件循环，避免切换页面时整帧卡住。"""
+        if not self.isVisible():
+            return
+        generation = self._folder_generation
+        budget = self._FOLDER_BATCH
+        while budget > 0 and self._folder_queue:
+            folder = self._folder_queue.pop(0)
+            card = PlanFolderCard(folder, self._folder_parent)
+            card.open_requested.connect(self.show_detail)
+            card.move_requested.connect(self.move_folder)
+            card.delete_requested.connect(self.delete_folder)
+            self._folder_flow.addWidget(card)
+            budget -= 1
+        if self._folder_queue:
+            QTimer.singleShot(
+                0, lambda: self._folder_generation == generation and self._pump_folders())
 
     def _build_detail(self) -> None:
         self.rows = []
@@ -962,6 +986,8 @@ class PlanPage(QWidget):
         else:
             word_counts = self.db.word_count_map('book')
             movie_intros = self.db.intro_map('movie')
+            existing = {(r['media_type'], str(r['subject_id']))
+                        for r in self.db.list_all_records()}
             for position, item in enumerate(items, 1):
                 stats = ''
                 if item['media_type'] == 'book':
@@ -978,6 +1004,10 @@ class PlanPage(QWidget):
                 row.move_requested.connect(self.move_item)
                 row.delete_requested.connect(self.delete_item)
                 row.open_requested.connect(self.open_item)
+                if (item['media_type'], str(item['subject_id'])) in existing:
+                    row.setToolTip('点击查看记录详情')
+                else:
+                    row.setToolTip('点击查看条目详情')
                 self.detail_layout.addWidget(row)
                 self.rows.append(row)
         self.detail_layout.addStretch(1)
@@ -1000,6 +1030,9 @@ class PlanPage(QWidget):
         super().showEvent(event)
         if self._dirty:
             self.refresh()
+        if self._folder_queue:
+            # 上次切走时没建完，这里接着补。
+            self._pump_folders()
 
     def _set_type(self, media_type: str) -> None:
         self.media_type = media_type
@@ -1131,6 +1164,14 @@ class PlanPage(QWidget):
             # 刷新会重建列表并把滚动条重置到顶部，这里恢复到删除前的位置。
             self.detail_scroll.verticalScrollBar().setValue(scroll_value)
 
-    def open_item(self, url: str) -> None:
-        if url:
-            QDesktopServices.openUrl(QUrl(url))
+    def open_item(self, item) -> None:
+        record = self.db.find_record_any(item['media_type'], str(item['subject_id']))
+        if record is None:
+            # 只加进了计划、记录里还没有：先看条目详情，别直接跳豆瓣。
+            folder = self._current_folder()
+            source = f'来自计划「{folder["title"]}」' if folder else '计划'
+            open_item_detail(self.db, item, self.window(), source)
+            return
+        if open_record_detail(self.db, record, self.window()):
+            self.refresh()
+            self.record_changed.emit(record['media_type'])
